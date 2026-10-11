@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::error::CompileError;
 use crate::sema::SemanticAnalyzer;
+use crate::token::Span;
 
 pub struct X86GasCodegen<'a> {
     analyzer: &'a SemanticAnalyzer,
@@ -201,9 +202,26 @@ impl<'a> X86GasCodegen<'a> {
         match stmt {
             Stmt::Let { name, init, .. } => {
                 if let Some(init_expr) = init {
-                    asm.push_str(&self.generate_expr(init_expr)?);
-                    if let Some(sym) = self.lookup_var(name) {
-                        asm.push_str(&format!("    mov [ebp + ({})], eax\n", sym.offset));
+                    match init_expr {
+                        Expr::StructLit(struct_name, inits, _) => {
+                            if let Some(sym) = self.lookup_var(name) {
+                                self.generate_struct_lit(sym.offset, struct_name, inits, &mut asm)?;
+                            }
+                        }
+                        Expr::ArrayLit(elems, _) => {
+                            let sym = self.lookup_var(name).cloned();
+                            if let Some(sym) = sym {
+                                if let Type::Array(elem, _) = sym.ty.clone() {
+                                    self.generate_array_lit(sym.offset, &elem, elems, &mut asm)?;
+                                }
+                            }
+                        }
+                        _ => {
+                            asm.push_str(&self.generate_expr(init_expr)?);
+                            if let Some(sym) = self.lookup_var(name) {
+                                asm.push_str(&format!("    mov [ebp + ({})], eax\n", sym.offset));
+                            }
+                        }
                     }
                 }
             }
@@ -343,7 +361,62 @@ impl<'a> X86GasCodegen<'a> {
                     Some(*span),
                 ));
             }
+            Expr::Field(base, field, span) => {
+                let ty = self.type_of(base)?;
+                let (foff, fty) = self.field_info_from_type(&ty, field, *span)?;
+                match ty {
+                    Type::Struct(_) => self.generate_addr(base, &mut asm)?,
+                    Type::Pointer(_) => asm.push_str(&self.generate_expr(base)?),
+                    _ => unreachable!(),
+                }
+                self.load_at(&fty, "eax", foff as i32, &mut asm);
+            }
+            Expr::Index(base, _idx, span) => {
+                let elem_ty = match self.type_of(base)? {
+                    Type::Array(elem, _) | Type::Pointer(elem) => *elem,
+                    other => {
+                        return Err(CompileError::new(
+                            "GEN_008",
+                            format!("cannot index value of type {}", other.name()),
+                            Some(*span),
+                        ))
+                    }
+                };
+                let elem_size = elem_ty.size_in_bytes(&self.analyzer.symbols.structs);
+                self.generate_index_addr(base, _idx, elem_size, *span, &mut asm)?;
+                self.load_at(&elem_ty, "eax", 0, &mut asm);
+            }
+            Expr::StructLit(_, _, span) | Expr::ArrayLit(_, span) => {
+                return Err(CompileError::new(
+                    "GEN_006",
+                    "aggregate literals are only supported as let initializers or assignment values",
+                    Some(*span),
+                ))
+            }
             Expr::Assign { target, value, span } => {
+                if let (Expr::Ident(name, _), Expr::StructLit(struct_name, inits, _)) =
+                    (&**target, &**value)
+                {
+                    if let Some(sym) = self.lookup_var(name) {
+                        self.generate_struct_lit(sym.offset, struct_name, inits, &mut asm)?;
+                        return Ok(asm);
+                    }
+                }
+                if let (Expr::Ident(name, _), Expr::ArrayLit(elems, _)) =
+                    (&**target, &**value)
+                {
+                    let sym = self.lookup_var(name).cloned();
+                    if let Some(sym) = sym {
+                        if let Type::Array(elem, _) = sym.ty.clone() {
+                            self.generate_array_lit(sym.offset, &elem, elems, &mut asm)?;
+                            return Ok(asm);
+                        }
+                    }
+                }
+                if matches!(&**value, Expr::StructLit(..) | Expr::ArrayLit(..)) {
+                    self.generate_aggregate_assign(target, value, &mut asm)?;
+                    return Ok(asm);
+                }
                 asm.push_str(&self.generate_expr(value)?);
                 match &**target {
                     Expr::Ident(name, target_span) => {
@@ -363,6 +436,14 @@ impl<'a> X86GasCodegen<'a> {
                         asm.push_str("    mov edx, eax\n");
                         asm.push_str("    pop eax\n");
                         asm.push_str("    mov [edx], eax\n");
+                    }
+                    Expr::Field(..) | Expr::Index(..) => {
+                        let target_ty = self.type_of(target)?;
+                        asm.push_str("    push eax\n");
+                        self.generate_addr(target, &mut asm)?;
+                        asm.push_str("    mov edx, eax\n");
+                        asm.push_str("    pop eax\n");
+                        self.emit_store(&target_ty, "[edx]", &mut asm);
                     }
                     _ => {
                         return Err(CompileError::new(
@@ -388,6 +469,9 @@ impl<'a> X86GasCodegen<'a> {
                     }
                     Expr::Unary(UnaryOp::Deref, ptr_expr, _) => {
                         asm.push_str(&self.generate_expr(ptr_expr)?);
+                    }
+                    Expr::Field(..) | Expr::Index(..) => {
+                        self.generate_addr(inner, &mut asm)?;
                     }
                     _ => {
                         return Err(CompileError::new(
@@ -578,5 +662,481 @@ impl<'a> X86GasCodegen<'a> {
             asm.push_str("    int 0x80\n");
         }
         Ok(())
+    }
+
+    fn type_of(&self, expr: &Expr) -> Result<Type, CompileError> {
+        match expr {
+            Expr::IntLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) => Ok(match expr {
+                Expr::StringLit(..) => Type::Pointer(Box::new(Type::U8)),
+                Expr::BoolLit(..) => Type::Bool,
+                _ => Type::I32,
+            }),
+            Expr::Ident(name, span) => self
+                .lookup_var(name)
+                .map(|sym| sym.ty.clone())
+                .or_else(|| {
+                    self.analyzer
+                        .symbols
+                        .lookup_const(name)
+                        .map(|cs| cs.ty.clone())
+                })
+                .ok_or_else(|| {
+                    CompileError::new(
+                        "GEN_001",
+                        format!("unknown variable '{}'", name),
+                        Some(*span),
+                    )
+                }),
+            Expr::Field(base, field, span) => {
+                let ty = self.type_of(base)?;
+                let (foff, fty) = self.field_info_from_type(&ty, field, *span)?;
+                let _ = foff;
+                Ok(fty)
+            }
+            Expr::Index(base, _, span) => match self.type_of(base)? {
+                Type::Array(elem, _) | Type::Pointer(elem) => Ok(*elem),
+                other => Err(CompileError::new(
+                    "GEN_008",
+                    format!("cannot index value of type {}", other.name()),
+                    Some(*span),
+                )),
+            },
+            Expr::Unary(UnaryOp::Deref, inner, span) => match self.type_of(inner)? {
+                Type::Pointer(elem) => Ok(*elem),
+                other => Err(CompileError::new(
+                    "SEM_010",
+                    format!("cannot dereference value of type {}", other.name()),
+                    Some(*span),
+                )),
+            },
+            Expr::Unary(UnaryOp::AddrOf, inner, _) => {
+                Ok(Type::Pointer(Box::new(self.type_of(inner)?)))
+            }
+            Expr::Unary(UnaryOp::Not, ..) => Ok(Type::Bool),
+            Expr::Unary(_, inner, _) => self.type_of(inner),
+            Expr::Binary(op, left, right, _) => {
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                        | BinaryOp::And
+                        | BinaryOp::Or
+                ) {
+                    Ok(Type::Bool)
+                } else {
+                    let lty = self.type_of(left)?;
+                    let rty = self.type_of(right)?;
+                    if lty == rty {
+                        Ok(lty)
+                    } else if matches!(lty, Type::I32 | Type::U32) {
+                        Ok(lty)
+                    } else {
+                        Ok(rty)
+                    }
+                }
+            }
+            Expr::Call { callee, span, .. } => {
+                let name = match &**callee {
+                    Expr::Ident(name, _) => name.clone(),
+                    Expr::Path(parts, _) => parts.join("_"),
+                    _ => {
+                        return Err(CompileError::new(
+                            "GEN_005",
+                            "function call target must be an identifier or a path",
+                            Some(*span),
+                        ))
+                    }
+                };
+                self.analyzer
+                    .symbols
+                    .lookup_fn(&name)
+                    .map(|f| f.ret_type.clone())
+                    .ok_or_else(|| {
+                        CompileError::new(
+                            "SEM_002",
+                            format!("cannot find function '{}'", name),
+                            Some(*span),
+                        )
+                    })
+            }
+            Expr::Assign { target, .. } => self.type_of(target),
+            Expr::StructLit(name, _, span) => {
+                if self.analyzer.symbols.lookup_struct(name).is_none() {
+                    return Err(CompileError::new(
+                        "SEM_018",
+                        format!("unknown struct '{}'", name),
+                        Some(*span),
+                    ));
+                }
+                Ok(Type::Struct(name.clone()))
+            }
+            Expr::ArrayLit(elems, span) => {
+                if elems.is_empty() {
+                    return Err(CompileError::new(
+                        "SEM_018",
+                        "empty array literal",
+                        Some(*span),
+                    ));
+                }
+                let elem_ty = self.type_of(&elems[0])?;
+                Ok(Type::Array(Box::new(elem_ty), elems.len()))
+            }
+            Expr::Syscall { .. } => Ok(Type::I32),
+            Expr::Path(_, span) => Err(CompileError::new(
+                "GEN_003",
+                "path expression cannot be used as a value",
+                Some(*span),
+            )),
+        }
+    }
+
+    fn field_info_from_type(
+        &self,
+        ty: &Type,
+        field: &str,
+        span: Span,
+    ) -> Result<(u32, Type), CompileError> {
+        let struct_name = match ty {
+            Type::Struct(name) => name.clone(),
+            Type::Pointer(inner) if matches!(**inner, Type::Struct(_)) => match **inner {
+                Type::Struct(ref name) => name.clone(),
+                _ => unreachable!(),
+            },
+            other => {
+                return Err(CompileError::new(
+                    "SEM_015",
+                    format!("field access on non-struct type {}", other.name()),
+                    Some(span),
+                ))
+            }
+        };
+        let def = self.analyzer.symbols.lookup_struct(&struct_name).ok_or_else(|| {
+            CompileError::new("SEM_001", format!("unknown struct '{}'", struct_name), Some(span))
+        })?;
+        let layout = crate::ast::struct_layout(def, &self.analyzer.symbols.structs);
+        layout
+            .into_iter()
+            .find(|f| f.name == field)
+            .map(|f| (f.offset, f.ty))
+            .ok_or_else(|| {
+                CompileError::new(
+                    "SEM_015",
+                    format!("struct '{}' has no field '{}'", struct_name, field),
+                    Some(span),
+                )
+            })
+    }
+
+    fn emit_store(&self, ty: &Type, mem: &str, asm: &mut String) {
+        match ty.size_in_bytes(&self.analyzer.symbols.structs) {
+            2 => asm.push_str(&format!("    mov {}, ax\n", mem)),
+            1 => asm.push_str(&format!("    mov {}, al\n", mem)),
+            _ => asm.push_str(&format!("    mov {}, eax\n", mem)),
+        }
+    }
+
+    fn load_at(&self, ty: &Type, addr: &str, offset: i32, asm: &mut String) {
+        let deref = if offset == 0 {
+            format!("[{}]", addr)
+        } else {
+            format!("[{} + {}]", addr, offset)
+        };
+        match ty.size_in_bytes(&self.analyzer.symbols.structs) {
+            2 => asm.push_str(&format!("    movzx eax, word ptr {}\n", deref)),
+            1 => asm.push_str(&format!("    movzx eax, byte ptr {}\n", deref)),
+            _ => asm.push_str(&format!("    mov eax, {}\n", deref)),
+        }
+    }
+
+    /// Address of an lvalue expression in eax (struct value, field, index,
+    /// dereference, or &x).
+    fn generate_addr(&mut self, expr: &Expr, asm: &mut String) -> Result<(), CompileError> {
+        match expr {
+            Expr::Ident(name, span) => {
+                let sym = self.lookup_var(name).ok_or_else(|| {
+                    CompileError::new("GEN_001", format!("unknown variable '{}'", name), Some(*span))
+                })?;
+                asm.push_str(&format!("    lea eax, [ebp + ({})]\n", sym.offset));
+                Ok(())
+            }
+            Expr::Field(base, field, span) => {
+                let ty = self.type_of(base)?;
+                let (foff, _) = self.field_info_from_type(&ty, field, *span)?;
+                match ty {
+                    Type::Struct(_) => self.generate_addr(base, asm)?,
+                    Type::Pointer(_) => asm.push_str(&self.generate_expr(base)?),
+                    _ => unreachable!(),
+                }
+                if foff != 0 {
+                    asm.push_str(&format!("    add eax, {}\n", foff));
+                }
+                Ok(())
+            }
+            Expr::Index(base, idx, span) => {
+                let elem_size = match self.type_of(base)? {
+                    Type::Array(elem, _) | Type::Pointer(elem) => {
+                        elem.size_in_bytes(&self.analyzer.symbols.structs)
+                    }
+                    other => {
+                        return Err(CompileError::new(
+                            "GEN_008",
+                            format!("cannot index value of type {}", other.name()),
+                            Some(*span),
+                        ))
+                    }
+                };
+                self.generate_index_addr(base, idx, elem_size, *span, asm)
+            }
+            Expr::Unary(UnaryOp::Deref, ptr, _) => {
+                asm.push_str(&self.generate_expr(ptr)?);
+                Ok(())
+            }
+            Expr::Unary(UnaryOp::AddrOf, inner, _) => self.generate_addr(inner, asm),
+            _ => Err(CompileError::new(
+                "GEN_004",
+                "expression is not addressable",
+                Some(expr.span()),
+            )),
+        }
+    }
+
+    fn generate_index_addr(
+        &mut self,
+        base: &Expr,
+        idx: &Expr,
+        elem_size: usize,
+        span: Span,
+        asm: &mut String,
+    ) -> Result<(), CompileError> {
+        if elem_size != 1 && elem_size != 2 && elem_size != 4 {
+            return Err(CompileError::new(
+                "GEN_009",
+                format!("unsupported element size {} for indexing", elem_size),
+                Some(span),
+            ));
+        }
+        asm.push_str(&self.generate_expr(idx)?);
+        asm.push_str("    push eax\n");
+        match self.type_of(base)? {
+            Type::Array(..) => self.generate_addr(base, asm)?,
+            Type::Pointer(..) => asm.push_str(&self.generate_expr(base)?),
+            other => {
+                return Err(CompileError::new(
+                    "GEN_008",
+                    format!("cannot index value of type {}", other.name()),
+                    Some(span),
+                ))
+            }
+        }
+        asm.push_str("    pop ecx\n");
+        match elem_size {
+            2 => asm.push_str("    shl ecx, 1\n"),
+            4 => asm.push_str("    shl ecx, 2\n"),
+            _ => {}
+        }
+        asm.push_str("    add eax, ecx\n");
+        Ok(())
+    }
+
+    fn generate_struct_lit(
+        &mut self,
+        dest_off: i32,
+        struct_name: &str,
+        inits: &[(String, Expr)],
+        asm: &mut String,
+    ) -> Result<(), CompileError> {
+        let def = self
+            .analyzer
+            .symbols
+            .lookup_struct(struct_name)
+            .cloned()
+            .ok_or_else(|| {
+                CompileError::new(
+                    "SEM_018",
+                    format!("unknown struct '{}'", struct_name),
+                    None,
+                )
+            })?;
+        let layout = crate::ast::struct_layout(&def, &self.analyzer.symbols.structs);
+        for (field_name, value) in inits {
+            let (foff, fty) = layout
+                .iter()
+                .find(|f| f.name == *field_name)
+                .map(|f| (f.offset as i32, f.ty.clone()))
+                .ok_or_else(|| {
+                    CompileError::new(
+                        "SEM_015",
+                        format!("struct '{}' has no field '{}'", struct_name, field_name),
+                        None,
+                    )
+                })?;
+            self.emit_field_store(dest_off, foff, &fty, value, asm)?;
+        }
+        Ok(())
+    }
+
+    /// Writes one field/element value to [ebp + (dest_off + foff)], recursing
+    /// for nested aggregate literals.
+    fn emit_field_store(
+        &mut self,
+        dest_off: i32,
+        foff: i32,
+        ty: &Type,
+        value: &Expr,
+        asm: &mut String,
+    ) -> Result<(), CompileError> {
+        match value {
+            Expr::StructLit(name, inits, _) => {
+                self.generate_struct_lit(dest_off + foff, name, inits, asm)
+            }
+            Expr::ArrayLit(elems, _) => {
+                let elem_ty = match ty {
+                    Type::Array(elem, _) => (**elem).clone(),
+                    _ => self.type_of(&elems[0])?,
+                };
+                self.generate_array_lit(dest_off + foff, &elem_ty, elems, asm)
+            }
+            _ => {
+                asm.push_str(&self.generate_expr(value)?);
+                self.emit_store(ty, &format!("[ebp + ({})]", dest_off + foff), asm);
+                Ok(())
+            }
+        }
+    }
+
+    fn generate_array_lit(
+        &mut self,
+        dest_off: i32,
+        elem_ty: &Type,
+        elems: &[Expr],
+        asm: &mut String,
+    ) -> Result<(), CompileError> {
+        let elem_size = elem_ty.size_in_bytes(&self.analyzer.symbols.structs);
+        for (i, elem) in elems.iter().enumerate() {
+            asm.push_str(&self.generate_expr(elem)?);
+            self.emit_store(
+                elem_ty,
+                &format!("[ebp + ({})]", dest_off + (i * elem_size) as i32),
+                asm,
+            );
+        }
+        Ok(())
+    }
+
+    fn generate_aggregate_assign(
+        &mut self,
+        target: &Expr,
+        value: &Expr,
+        asm: &mut String,
+    ) -> Result<(), CompileError> {
+        self.generate_addr(target, asm)?;
+        asm.push_str("    push eax\n");
+        match value {
+            Expr::StructLit(name, inits, _) => {
+                self.write_struct_lit_dynamic(name, inits, asm)?
+            }
+            Expr::ArrayLit(elems, _) => {
+                let elem_ty = match self.type_of(target)? {
+                    Type::Array(elem, _) => *elem,
+                    other => {
+                        return Err(CompileError::new(
+                            "GEN_008",
+                            format!("cannot assign array to {}", other.name()),
+                            None,
+                        ))
+                    }
+                };
+                self.write_array_lit_dynamic(&elem_ty, elems, asm)?
+            }
+            _ => unreachable!(),
+        }
+        asm.push_str("    add esp, 4\n");
+        Ok(())
+    }
+
+    /// Writes a struct literal into the address held at [esp] (kept there for
+    /// the whole loop so value expressions may use the stack freely).
+    fn write_struct_lit_dynamic(
+        &mut self,
+        struct_name: &str,
+        inits: &[(String, Expr)],
+        asm: &mut String,
+    ) -> Result<(), CompileError> {
+        let def = self
+            .analyzer
+            .symbols
+            .lookup_struct(struct_name)
+            .cloned()
+            .ok_or_else(|| {
+                CompileError::new(
+                    "SEM_018",
+                    format!("unknown struct '{}'", struct_name),
+                    None,
+                )
+            })?;
+        let layout = crate::ast::struct_layout(&def, &self.analyzer.symbols.structs);
+        for (field_name, init) in inits {
+            let (foff, fty) = layout
+                .iter()
+                .find(|f| f.name == *field_name)
+                .map(|f| (f.offset as i32, f.ty.clone()))
+                .ok_or_else(|| {
+                    CompileError::new(
+                        "SEM_015",
+                        format!("struct '{}' has no field '{}'", struct_name, field_name),
+                        None,
+                    )
+                })?;
+            match init {
+                Expr::StructLit(name, inits, _) => {
+                    asm.push_str(&format!("    mov eax, [esp]\n    add eax, {}\n    push eax\n", foff));
+                    self.write_struct_lit_dynamic(name, inits, asm)?;
+                    asm.push_str("    add esp, 4\n");
+                }
+                Expr::ArrayLit(elems, _) => {
+                    let elem_ty = match &fty {
+                        Type::Array(elem, _) => (**elem).clone(),
+                        _ => self.type_of(&elems[0])?,
+                    };
+                    asm.push_str(&format!("    mov eax, [esp]\n    add eax, {}\n    push eax\n", foff));
+                    self.write_array_lit_dynamic(&elem_ty, elems, asm)?;
+                    asm.push_str("    add esp, 4\n");
+                }
+                _ => {
+                    asm.push_str(&self.generate_expr(init)?);
+                    asm.push_str("    mov edx, [esp]\n");
+                    self.emit_store_to_edx(&fty, foff, asm);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_array_lit_dynamic(
+        &mut self,
+        elem_ty: &Type,
+        elems: &[Expr],
+        asm: &mut String,
+    ) -> Result<(), CompileError> {
+        let elem_size = elem_ty.size_in_bytes(&self.analyzer.symbols.structs);
+        for (i, elem) in elems.iter().enumerate() {
+            asm.push_str(&self.generate_expr(elem)?);
+            asm.push_str("    mov edx, [esp]\n");
+            self.emit_store_to_edx(elem_ty, (i * elem_size) as i32, asm);
+        }
+        Ok(())
+    }
+
+    fn emit_store_to_edx(&self, ty: &Type, offset: i32, asm: &mut String) {
+        let deref = if offset == 0 {
+            "[edx]".to_string()
+        } else {
+            format!("[edx + {}]", offset)
+        };
+        self.emit_store(ty, &deref, asm);
     }
 }
