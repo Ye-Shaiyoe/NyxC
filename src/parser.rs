@@ -105,10 +105,11 @@ impl Parser {
                 self.parse_fn(true).map(Item::Fn)
             }
             TokenKind::Const => self.parse_const().map(Item::Const),
+            TokenKind::Struct => self.parse_struct().map(Item::Struct),
             _ => Err(CompileError::new(
                 "PAR_002",
                 format!(
-                    "expected an item (fn, const, or import), found {}",
+                    "expected an item (fn, struct, const, or import), found {}",
                     self.peek_kind().describe()
                 ),
                 Some(self.peek().span),
@@ -191,10 +192,73 @@ impl Parser {
         })
     }
 
+    fn parse_struct(&mut self) -> Result<StructDef, CompileError> {
+        let start = self.expect(TokenKind::Struct)?.span;
+        let name = self.parse_ident("a struct name")?;
+        self.skip_newlines();
+        self.expect(TokenKind::LBrace)?;
+
+        let mut fields = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
+            self.skip_newlines();
+            let field_span = self.peek().span;
+            let field_name = self.parse_ident("a field name")?;
+            self.expect(TokenKind::Colon)?;
+            let field_ty = self.parse_type()?;
+            fields.push(FieldDef {
+                name: field_name,
+                ty: field_ty,
+                span: field_span,
+            });
+            self.match_token(TokenKind::Comma);
+            self.skip_newlines();
+        }
+        self.expect(TokenKind::RBrace)?;
+        self.consume_stmt_terminator();
+
+        Ok(StructDef {
+            name,
+            fields,
+            span: start,
+        })
+    }
+
+    /// `Name { ... }` is a struct literal only when the brace opens an empty
+    /// body or a `field: value` pair; otherwise the brace belongs to a
+    /// following block (e.g. the body of `if cond {`).
+    fn looks_like_struct_literal(&self) -> bool {
+        match self.tokens.get(self.pos + 1).map(|t| &t.kind) {
+            Some(TokenKind::RBrace) => true,
+            Some(TokenKind::Ident(_)) => matches!(
+                self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                Some(TokenKind::Colon)
+            ),
+            _ => false,
+        }
+    }
+
     fn parse_type(&mut self) -> Result<Type, CompileError> {
         if self.match_token(TokenKind::Star) {
             let inner = self.parse_type()?;
             return Ok(Type::Pointer(Box::new(inner)));
+        }
+
+        if self.match_token(TokenKind::LBracket) {
+            let elem = self.parse_type()?;
+            self.expect(TokenKind::Semicolon)?;
+            let len_tok = self.advance();
+            let len = match len_tok.kind {
+                TokenKind::IntLit(n) if n > 0 && n <= 65536 => n as usize,
+                _ => {
+                    return Err(CompileError::new(
+                        "PAR_006",
+                        format!("array type needs a length literal up to 65536, found {}", len_tok.kind.describe()),
+                        Some(len_tok.span),
+                    ))
+                }
+            };
+            self.expect(TokenKind::RBracket)?;
+            return Ok(Type::Array(Box::new(elem), len));
         }
 
         let tok = self.advance();
@@ -207,6 +271,7 @@ impl Parser {
             TokenKind::TypeU32 => Ok(Type::U32),
             TokenKind::TypeBool => Ok(Type::Bool),
             TokenKind::TypeVoid => Ok(Type::Void),
+            TokenKind::Ident(name) => Ok(Type::Struct(name)),
             _ => Err(CompileError::new(
                 "PAR_003",
                 format!("expected a type, found {}", tok.kind.describe()),
@@ -580,6 +645,15 @@ impl Parser {
                     args,
                     span,
                 };
+            } else if self.match_token(TokenKind::Dot) {
+                let span = self.peek().span;
+                let field = self.parse_ident("a field name after '.'")?;
+                expr = Expr::Field(Box::new(expr), field, span);
+            } else if self.match_token(TokenKind::LBracket) {
+                let span = self.peek().span;
+                let index = self.parse_expr()?;
+                self.expect(TokenKind::RBracket)?;
+                expr = Expr::Index(Box::new(expr), Box::new(index), span);
             } else {
                 break;
             }
@@ -614,9 +688,36 @@ impl Parser {
                     let mut path = vec![id];
                     path.push(self.parse_ident("an identifier after '::'")?);
                     Ok(Expr::Path(path, tok.span))
+                } else if matches!(self.peek_kind(), TokenKind::LBrace)
+                    && self.looks_like_struct_literal()
+                {
+                    self.advance();
+                    let mut inits = Vec::new();
+                    while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
+                        let field = self.parse_ident("a field name")?;
+                        self.expect(TokenKind::Colon)?;
+                        let value = self.parse_expr()?;
+                        inits.push((field, value));
+                        if !self.match_token(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(TokenKind::RBrace)?;
+                    Ok(Expr::StructLit(id, inits, tok.span))
                 } else {
                     Ok(Expr::Ident(id, tok.span))
                 }
+            }
+            TokenKind::LBracket => {
+                let mut elems = Vec::new();
+                while !matches!(self.peek_kind(), TokenKind::RBracket | TokenKind::Eof) {
+                    elems.push(self.parse_expr()?);
+                    if !self.match_token(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RBracket)?;
+                Ok(Expr::ArrayLit(elems, tok.span))
             }
             TokenKind::LParen => {
                 let inner = self.parse_expr()?;
