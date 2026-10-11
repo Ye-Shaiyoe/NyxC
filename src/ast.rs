@@ -1,3 +1,4 @@
+use crate::sema::symbols::StructTable;
 use crate::token::Span;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,15 +12,22 @@ pub enum Type {
     Bool,
     Void,
     Pointer(Box<Type>),
+    Struct(String),
+    Array(Box<Type>, usize),
 }
 
 impl Type {
-    pub fn size_in_bytes(&self) -> usize {
+    pub fn size_in_bytes(&self, structs: &StructTable) -> usize {
         match self {
             Type::I8 | Type::U8 | Type::Bool => 1,
             Type::I16 | Type::U16 => 2,
-            Type::I32 | Type::U32 | Type::Pointer(_) => 4, // 32-bit x86 target
+            Type::I32 | Type::U32 | Type::Pointer(_) => 4,
             Type::Void => 0,
+            Type::Array(elem, len) => elem.size_in_bytes(structs) * len,
+            Type::Struct(name) => structs
+                .get(name)
+                .map(|def| struct_size(def, structs))
+                .unwrap_or(0),
         }
     }
 
@@ -34,6 +42,8 @@ impl Type {
             Type::Bool => "bool".into(),
             Type::Void => "void".into(),
             Type::Pointer(inner) => format!("*{}", inner.name()),
+            Type::Struct(name) => name.clone(),
+            Type::Array(elem, len) => format!("[{}; {}]", elem.name(), len),
         }
     }
 }
@@ -76,6 +86,10 @@ pub enum Expr {
     BoolLit(bool, Span),
     Ident(String, Span),
     Path(Vec<String>, Span),
+    Field(Box<Expr>, String, Span),
+    Index(Box<Expr>, Box<Expr>, Span),
+    StructLit(String, Vec<(String, Expr)>, Span),
+    ArrayLit(Vec<Expr>, Span),
     Binary(BinaryOp, Box<Expr>, Box<Expr>, Span),
     Unary(UnaryOp, Box<Expr>, Span),
     Call {
@@ -103,6 +117,10 @@ impl Expr {
             Expr::BoolLit(_, s) => *s,
             Expr::Ident(_, s) => *s,
             Expr::Path(_, s) => *s,
+            Expr::Field(_, _, s) => *s,
+            Expr::Index(_, _, s) => *s,
+            Expr::StructLit(_, _, s) => *s,
+            Expr::ArrayLit(_, s) => *s,
             Expr::Binary(_, _, _, s) => *s,
             Expr::Unary(_, _, s) => *s,
             Expr::Call { span, .. } => *span,
@@ -163,6 +181,59 @@ pub struct Param {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldDef {
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<FieldDef>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldLayout {
+    pub name: String,
+    pub ty: Type,
+    pub offset: u32,
+}
+
+/// Field offsets in declaration order. Each field is aligned to its natural
+/// alignment (1, 2, or 4 bytes; aggregate fields align to 4); the total size
+/// is rounded up to 4 so struct locals keep the stack frame aligned.
+pub fn struct_layout(def: &StructDef, structs: &StructTable) -> Vec<FieldLayout> {
+    let mut offset = 0u32;
+    def.fields
+        .iter()
+        .map(|field| {
+            let size = field.ty.size_in_bytes(structs) as u32;
+            let align = size.min(4);
+            offset = (offset + align - 1) & !(align - 1);
+            let at = offset;
+            offset += size;
+            FieldLayout {
+                name: field.name.clone(),
+                ty: field.ty.clone(),
+                offset: at,
+            }
+        })
+        .collect()
+}
+
+pub fn struct_size(def: &StructDef, structs: &StructTable) -> usize {
+    let layout = struct_layout(def, structs);
+    match layout.last() {
+        Some(field) => (field.offset + field.ty.size_in_bytes(structs) as u32 + 3) as usize & !3,
+        None => 0,
+    }
+}
+
+pub type StructMap = StructTable;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDef {
     pub name: String,
@@ -185,6 +256,7 @@ pub struct Import {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Fn(FnDef),
+    Struct(StructDef),
     Import(Import),
     Const(Stmt),
 }
