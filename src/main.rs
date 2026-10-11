@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use nyxc::driver::{CompileOptions, Driver};
+use nyxc::driver::{Backend, CompileOptions, Driver};
 use nyxc::error::{render, CompileError};
 use nyxc::lexer::Lexer;
 use nyxc::parser::Parser;
@@ -19,6 +19,7 @@ fn print_help() {
     println!("Options:");
     println!("  -o <path>                          Specify output binary path");
     println!("  --target <triple>                  Target triple (default: nyxara-x86)");
+    println!("  --backend <gas|native>             Code emitter (default: gas on host, native in-OS)");
     println!("  -k, --keep-temps                   Keep intermediate .s and .o files");
     println!("  -h, --help                         Show help information");
     println!("  -v, --version                      Show version");
@@ -44,6 +45,7 @@ fn main() {
     let mut target = Target::nyxara_x86();
     let mut emit_asm = false;
     let mut keep_intermediates = false;
+    let mut backend = Backend::Gas;
 
     let mut i = 1;
     while i < args.len() {
@@ -91,6 +93,21 @@ fn main() {
             }
             "-k" | "--keep-temps" => {
                 keep_intermediates = true;
+            }
+            "--backend" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --backend requires gas or native");
+                    process::exit(1);
+                }
+                backend = match args[i].as_str() {
+                    "gas" => Backend::Gas,
+                    "native" => Backend::Native,
+                    other => {
+                        eprintln!("Error: unknown backend '{}' (expected gas or native)", other);
+                        process::exit(1);
+                    }
+                };
             }
             "--emit-asm" => {
                 emit_asm = true;
@@ -160,6 +177,7 @@ fn main() {
         target,
         emit_asm,
         keep_intermediates,
+        backend,
     };
 
     match Driver::compile(options) {
