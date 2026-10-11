@@ -1,0 +1,42 @@
+// 09_struct.nyx
+// Belajar struct (tipe data bentukan) dan array
+import "nyx/sys"
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+struct Rect {
+    origin: Point,
+    w: i16,
+    h: i16,
+}
+
+fn main() -> i32 {
+    let p = Point { x: 3, y: 7 }
+    println(itoa(p.x))
+    println(itoa(p.y))
+
+    let mut r = Rect { origin: Point { x: 1, y: 2 }, w: 10, h: 20 }
+    r.origin.x = 42
+    r.w = 15
+    println(itoa(r.origin.x))
+    println(itoa(r.w))
+
+    let arr: [i32; 4] = [10, 20, 30, 40]
+    let mut sum = 0
+    for (let mut k = 0; k < 4; k = k + 1) {
+        sum = sum + arr[k]
+    }
+    println(itoa(sum))
+
+    let bytes: [u8; 3] = [1, 2, 3]
+    let mut bsum = 0
+    for (let mut k = 0; k < 3; k = k + 1) {
+        bsum = bsum + bytes[k]
+    }
+    println(itoa(bsum))
+
+    return sum + bsum
+}
