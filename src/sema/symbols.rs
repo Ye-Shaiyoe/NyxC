@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use crate::ast::Type;
+use crate::ast::{StructDef, Type};
+
+pub type StructTable = HashMap<String, StructDef>;
 
 #[derive(Debug, Clone)]
 pub struct Symbol {
@@ -56,6 +58,7 @@ pub struct SymbolTable {
     functions: HashMap<String, FnSymbol>,
     fn_locals: HashMap<String, HashMap<String, Symbol>>,
     constants: HashMap<String, ConstSymbol>,
+    pub structs: StructTable,
 }
 
 impl SymbolTable {
@@ -65,7 +68,23 @@ impl SymbolTable {
             functions: HashMap::new(),
             fn_locals: HashMap::new(),
             constants: HashMap::new(),
+            structs: StructTable::new(),
         }
+    }
+
+    pub fn register_struct(&mut self, def: StructDef) {
+        self.structs.insert(def.name.clone(), def);
+    }
+
+    pub fn fn_vars(&self, fn_name: &str) -> Vec<(&str, i32)> {
+        self.fn_locals
+            .get(fn_name)
+            .map(|m| m.iter().map(|(k, v)| (k.as_str(), v.offset)).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn lookup_struct(&self, name: &str) -> Option<&StructDef> {
+        self.structs.get(name)
     }
 
     pub fn enter_scope(&mut self) {
