@@ -16,3 +16,17 @@ pub fn is_assignable(target: &Type, source: &Type) -> bool {
         _ => false,
     }
 }
+
+/// An integer literal may initialize a narrower integer type when the value
+/// fits, e.g. `w: i16 = 10`.
+pub fn int_fits(ty: &Type, n: i64) -> bool {
+    match ty {
+        Type::I8 => (-128..=127).contains(&n),
+        Type::I16 => (-32768..=32767).contains(&n),
+        Type::I32 => (i32::MIN as i64..=i32::MAX as i64).contains(&n),
+        Type::U8 => (0..=255).contains(&n),
+        Type::U16 => (0..=65535).contains(&n),
+        Type::U32 => (0..=u32::MAX as i64).contains(&n),
+        _ => false,
+    }
+}
