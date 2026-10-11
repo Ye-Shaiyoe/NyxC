@@ -25,6 +25,7 @@ pub enum TokenKind {
     Import,
     Syscall,
     Extern,
+    Struct,
     True,
     False,
 
@@ -54,6 +55,7 @@ pub enum TokenKind {
     Comma,
     Colon,
     PathSep,      // ::
+    Dot,          // .
     Semicolon,
     Arrow,        // ->
     Newline,
@@ -99,6 +101,7 @@ impl TokenKind {
             Import => "keyword 'import'".into(),
             Syscall => "keyword 'syscall'".into(),
             Extern => "keyword 'extern'".into(),
+            Struct => "keyword 'struct'".into(),
             True => "literal 'true'".into(),
             False => "literal 'false'".into(),
             TypeI8 => "type 'i8'".into(),
@@ -122,6 +125,7 @@ impl TokenKind {
             Comma => "','".into(),
             Colon => "':'".into(),
             PathSep => "'::'".into(),
+            Dot => "'.'".into(),
             Semicolon => "';'".into(),
             Arrow => "'->'".into(),
             Newline => "newline".into(),
