@@ -5,7 +5,7 @@ use crate::ast::*;
 use crate::error::CompileError;
 use crate::token::Span;
 use self::symbols::{FnSymbol, Symbol, SymbolTable};
-use self::types::is_assignable;
+use self::types::{int_fits, is_assignable};
 
 pub struct SemanticAnalyzer {
     pub symbols: SymbolTable,
@@ -113,6 +113,16 @@ impl SemanticAnalyzer {
                         is_extern: f.is_extern,
                     };
                     self.symbols.register_fn(fn_sym);
+                }
+                Item::Struct(def) => {
+                    if self.symbols.lookup_struct(&def.name).is_some() {
+                        return Err(CompileError::new(
+                            "SEM_019",
+                            format!("duplicate struct definition '{}'", def.name),
+                            Some(def.span),
+                        ));
+                    }
+                    self.symbols.register_struct(def.clone());
                 }
                 Item::Const(Stmt::Const { name, ty, init, span }) => {
                     self.analyze_const(name, ty.as_ref(), init, *span)?;
@@ -312,6 +322,68 @@ impl SemanticAnalyzer {
         }
     }
 
+    /// Assignment/initializer compatibility: type rules plus integer literals
+    /// that fit a narrower integer target (e.g. an i16 struct field).
+    fn check_assign_value(&self, target: &Type, value: &Expr, span: Span) -> Result<(), CompileError> {
+        if let Expr::IntLit(n, _) = value {
+            if int_fits(target, *n) {
+                return Ok(());
+            }
+        }
+        if let (Type::Array(elem, len), Expr::ArrayLit(elems, _)) = (target, value) {
+            if *len == elems.len()
+                && elems
+                    .iter()
+                    .all(|e| matches!(e, Expr::IntLit(n, _) if int_fits(elem, *n)))
+            {
+                return Ok(());
+            }
+        }
+        let val_ty = self.type_of_expr(value)?;
+        if is_assignable(target, &val_ty) {
+            Ok(())
+        } else {
+            Err(CompileError::new(
+                "SEM_003",
+                format!(
+                    "type mismatch: cannot assign {} to {}",
+                    val_ty.name(),
+                    target.name()
+                ),
+                Some(span),
+            ))
+        }
+    }
+
+    /// Walks an assignment target (variable, field, index, deref) and rejects
+    /// writes to constants and immutable variables at the root.
+    fn check_mut_target(&self, target: &Expr) -> Result<(), CompileError> {
+        match target {
+            Expr::Ident(name, span) => {
+                if self.symbols.lookup_const(name).is_some() {
+                    return Err(CompileError::new(
+                        "SEM_004",
+                        format!("cannot assign to constant '{}'", name),
+                        Some(*span),
+                    ));
+                }
+                if let Some(sym) = self.symbols.lookup_var(name) {
+                    if !sym.is_mut {
+                        return Err(CompileError::new(
+                            "SEM_004",
+                            format!("cannot assign twice to immutable variable '{}'", name),
+                            Some(*span),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Expr::Field(base, _, _) | Expr::Index(base, _, _) => self.check_mut_target(base),
+            Expr::Unary(UnaryOp::Deref, _, _) => Ok(()),
+            _ => Ok(()),
+        }
+    }
+
     fn analyze_fn(&mut self, def: &mut FnDef, body: &[Stmt]) -> Result<(), CompileError> {
         self.symbols.enter_scope();
 
@@ -365,18 +437,8 @@ impl SemanticAnalyzer {
                 };
 
                 let var_ty = match (ty, &init_ty) {
-                    (Some(explicit_ty), Some(expr_ty)) => {
-                        if !is_assignable(explicit_ty, expr_ty) {
-                            return Err(CompileError::new(
-                                "SEM_003",
-                                format!(
-                                    "type mismatch: cannot assign {} to {}",
-                                    expr_ty.name(),
-                                    explicit_ty.name()
-                                ),
-                                Some(*span),
-                            ));
-                        }
+                    (Some(explicit_ty), Some(_)) => {
+                        self.check_assign_value(explicit_ty, init.as_ref().unwrap(), *span)?;
                         explicit_ty.clone()
                     }
                     (Some(explicit_ty), None) => explicit_ty.clone(),
@@ -393,13 +455,15 @@ impl SemanticAnalyzer {
                     }
                 };
 
+                let size = var_ty.size_in_bytes(&self.symbols.structs);
+                let alloc = if size < 4 { 4 } else { ((size + 3) & !3) as i32 };
                 self.symbols.record_fn_var(fn_name, Symbol {
                     name: name.clone(),
                     ty: var_ty,
                     is_mut: *is_mut,
                     offset: *local_offset,
                 });
-                *local_offset -= 4;
+                *local_offset -= alloc;
             }
             Stmt::Return { value, span } => {
                 let val_ty = if let Some(expr) = value {
@@ -555,6 +619,128 @@ impl SemanticAnalyzer {
                     ))
                 }
             }
+            Expr::Field(base, field, span) => {
+                let base_ty = self.type_of_expr(base)?;
+                let struct_name = match &base_ty {
+                    Type::Struct(name) => name.clone(),
+                    Type::Pointer(inner) => match inner.as_ref() {
+                        Type::Struct(name) => name.clone(),
+                        _ => unreachable!(),
+                    },
+                    other => {
+                        return Err(CompileError::new(
+                            "SEM_015",
+                            format!("field access on non-struct type {}", other.name()),
+                            Some(*span),
+                        ))
+                    }
+                };
+                let def = self
+                    .symbols
+                    .lookup_struct(&struct_name)
+                    .ok_or_else(|| {
+                        CompileError::new(
+                            "SEM_001",
+                            format!("unknown struct '{}'", struct_name),
+                            Some(*span),
+                        )
+                    })?;
+                def.fields
+                    .iter()
+                    .find(|f| f.name == *field)
+                    .map(|f| f.ty.clone())
+                    .ok_or_else(|| {
+                        CompileError::new(
+                            "SEM_015",
+                            format!("struct '{}' has no field '{}'", struct_name, field),
+                            Some(*span),
+                        )
+                    })
+            }
+            Expr::Index(base, idx, span) => {
+                let idx_ty = self.type_of_expr(idx)?;
+                if !matches!(
+                    idx_ty,
+                    Type::I8 | Type::I16 | Type::I32 | Type::U8 | Type::U16 | Type::U32
+                ) {
+                    return Err(CompileError::new(
+                        "SEM_016",
+                        format!("array index must be an integer, found {}", idx_ty.name()),
+                        Some(*span),
+                    ));
+                }
+                match self.type_of_expr(base)? {
+                    Type::Array(elem, _) => Ok(*elem),
+                    Type::Pointer(elem) => Ok(*elem),
+                    other => Err(CompileError::new(
+                        "SEM_016",
+                        format!("cannot index value of type {}", other.name()),
+                        Some(*span),
+                    )),
+                }
+            }
+            Expr::StructLit(name, inits, span) => {
+                let def = self.symbols.lookup_struct(name).ok_or_else(|| {
+                    CompileError::new(
+                        "SEM_018",
+                        format!("unknown struct '{}' in literal", name),
+                        Some(*span),
+                    )
+                })?;
+                for (field_name, value) in inits {
+                    let field_ty = def
+                        .fields
+                        .iter()
+                        .find(|f| f.name == *field_name)
+                        .map(|f| f.ty.clone())
+                        .ok_or_else(|| {
+                            CompileError::new(
+                                "SEM_017",
+                                format!("struct '{}' has no field '{}'", name, field_name),
+                                Some(*span),
+                            )
+                        })?;
+                    self.check_assign_value(&field_ty, value, *span)?;
+                }
+                if inits.len() != def.fields.len() {
+                    return Err(CompileError::new(
+                        "SEM_017",
+                        format!(
+                            "struct '{}' literal needs {} fields, found {}",
+                            name,
+                            def.fields.len(),
+                            inits.len()
+                        ),
+                        Some(*span),
+                    ));
+                }
+                Ok(Type::Struct(name.clone()))
+            }
+            Expr::ArrayLit(elems, span) => {
+                let (first, rest) = elems.split_first().ok_or_else(|| {
+                    CompileError::new(
+                        "SEM_018",
+                        "empty array literal cannot infer an element type",
+                        Some(*span),
+                    )
+                })?;
+                let elem_ty = self.type_of_expr(first)?;
+                for elem in rest {
+                    let other = self.type_of_expr(elem)?;
+                    if !is_assignable(&elem_ty, &other) {
+                        return Err(CompileError::new(
+                            "SEM_018",
+                            format!(
+                                "array literal elements must share one type: {} and {}",
+                                elem_ty.name(),
+                                other.name()
+                            ),
+                            Some(*span),
+                        ));
+                    }
+                }
+                Ok(Type::Array(Box::new(elem_ty), elems.len()))
+            }
             Expr::Binary(op, left, right, span) => {
                 let lty = self.type_of_expr(left)?;
                 let rty = self.type_of_expr(right)?;
@@ -594,6 +780,7 @@ impl SemanticAnalyzer {
                                 }
                             }
                             Expr::Unary(UnaryOp::Deref, _, _) => {}
+                            Expr::Field(..) | Expr::Index(..) => {}
                             _ => {
                                 return Err(CompileError::new(
                                     "SEM_013",
@@ -681,37 +868,9 @@ impl SemanticAnalyzer {
                 Ok(Type::I32)
             }
             Expr::Assign { target, value, span } => {
-                if let Expr::Ident(name, id_span) = &**target {
-                    if self.symbols.lookup_const(name).is_some() {
-                        return Err(CompileError::new(
-                            "SEM_004",
-                            format!("cannot assign to constant '{}'", name),
-                            Some(*id_span),
-                        ));
-                    }
-                    if let Some(sym) = self.symbols.lookup_var(name) {
-                        if !sym.is_mut {
-                            return Err(CompileError::new(
-                                "SEM_004",
-                                format!("cannot assign twice to immutable variable '{}'", name),
-                                Some(*id_span),
-                            ));
-                        }
-                    }
-                }
+                self.check_mut_target(target)?;
                 let target_ty = self.type_of_expr(target)?;
-                let val_ty = self.type_of_expr(value)?;
-                if !is_assignable(&target_ty, &val_ty) {
-                    return Err(CompileError::new(
-                        "SEM_012",
-                        format!(
-                            "cannot assign {} to {}",
-                            val_ty.name(),
-                            target_ty.name()
-                        ),
-                        Some(*span),
-                    ));
-                }
+                self.check_assign_value(&target_ty, value, *span)?;
                 Ok(target_ty)
             }
         }
