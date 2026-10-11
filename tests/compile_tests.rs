@@ -1,4 +1,4 @@
-use nyxc::driver::{CompileOptions, Driver};
+use nyxc::driver::{Backend, CompileOptions, Driver};
 use nyxc::lexer::Lexer;
 use nyxc::parser::Parser;
 use nyxc::sema::SemanticAnalyzer;
@@ -165,6 +165,7 @@ fn test_str_len_e2e_elf() {
         target: Target::nyxara_x86(),
         emit_asm: false,
         keep_intermediates: true,
+        backend: Backend::Gas,
     };
 
     let result = Driver::compile(options);
@@ -197,6 +198,7 @@ fn test_compile_e2e_elf() {
         target: Target::nyxara_x86(),
         emit_asm: false,
         keep_intermediates: true,
+        backend: Backend::Gas,
     };
 
     let result = Driver::compile(options);
@@ -224,6 +226,7 @@ fn test_itoa_asm_generation() {
         target: Target::nyxara_x86(),
         emit_asm: false,
         keep_intermediates: true,
+        backend: Backend::Gas,
     };
 
     let result = Driver::compile(options);
@@ -246,6 +249,7 @@ fn test_emit_asm_custom_output() {
         target: Target::nyxara_x86(),
         emit_asm: true,
         keep_intermediates: false,
+        backend: Backend::Gas,
     };
 
     let result = Driver::compile(options);
@@ -270,4 +274,280 @@ fn test_addr_of_invalid_expr() {
     let mut sema = SemanticAnalyzer::new();
     let err = sema.analyze_program(&mut prog).unwrap_err();
     assert_eq!(err.code, "SEM_013");
+}
+
+#[test]
+fn test_struct_def_and_field_access() {
+    let src = r#"
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        fn main() -> i32 {
+            let p = Point { x: 3, y: 4 }
+            return p.x + p.y
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    assert!(sema.analyze_program(&mut prog).is_ok());
+}
+
+#[test]
+fn test_struct_unknown_field_rejected() {
+    let src = r#"
+        struct Point { x: i32 }
+        fn main() -> i32 {
+            let p = Point { x: 1 }
+            return p.z
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    let err = sema.analyze_program(&mut prog).unwrap_err();
+    assert_eq!(err.code, "SEM_015");
+}
+
+#[test]
+fn test_struct_literal_missing_field_rejected() {
+    let src = r#"
+        struct Point { x: i32, y: i32 }
+        fn main() -> i32 {
+            let p = Point { x: 1 }
+            return p.x
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    let err = sema.analyze_program(&mut prog).unwrap_err();
+    assert_eq!(err.code, "SEM_017");
+}
+
+#[test]
+fn test_duplicate_struct_rejected() {
+    let src = r#"
+        struct A { x: i32 }
+        struct A { y: i32 }
+        fn main() -> i32 { return 0 }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    let err = sema.analyze_program(&mut prog).unwrap_err();
+    assert_eq!(err.code, "SEM_019");
+}
+
+#[test]
+fn test_array_index_and_literal() {
+    let src = r#"
+        fn main() -> i32 {
+            let arr: [i32; 3] = [10, 20, 30]
+            let mut sum = 0
+            for (let mut i = 0; i < 3; i = i + 1) {
+                sum = sum + arr[i]
+            }
+            return sum
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    assert!(sema.analyze_program(&mut prog).is_ok());
+}
+
+#[test]
+fn test_index_on_non_array_rejected() {
+    let src = r#"
+        fn main() -> i32 {
+            let x = 5
+            return x[0]
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    let err = sema.analyze_program(&mut prog).unwrap_err();
+    assert_eq!(err.code, "SEM_016");
+}
+
+#[test]
+fn test_immutable_struct_field_rejected() {
+    let src = r#"
+        struct Point { x: i32 }
+        fn main() -> i32 {
+            let p = Point { x: 1 }
+            p.x = 2
+            return p.x
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    let err = sema.analyze_program(&mut prog).unwrap_err();
+    assert_eq!(err.code, "SEM_004");
+}
+
+#[test]
+fn test_narrow_int_literal_fits() {
+    let src = r#"
+        struct Rect { w: i16, h: i16 }
+        fn main() -> i32 {
+            let r = Rect { w: 10, h: 20 }
+            return r.w
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    assert!(sema.analyze_program(&mut prog).is_ok());
+}
+
+#[test]
+fn test_narrow_int_literal_overflow_rejected() {
+    let src = r#"
+        struct Rect { w: i16 }
+        fn main() -> i32 {
+            let r = Rect { w: 100000 }
+            return r.w
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    let err = sema.analyze_program(&mut prog).unwrap_err();
+    assert_eq!(err.code, "SEM_003");
+}
+
+#[test]
+fn test_if_block_not_parsed_as_struct_literal() {
+    let src = r#"
+        const MAX = 100
+        fn main() -> i32 {
+            let y = 10
+            if y < MAX {
+                y = 20
+            }
+            return y
+        }
+    "#;
+    let mut prog = parse(src);
+    assert_eq!(prog.items.len(), 2);
+}
+
+fn compile_to(src: &str, out: &str, backend: Backend) {
+    let file = format!("{}.nyx", out);
+    fs::write(&file, src).expect("failed to write test file");
+    let options = CompileOptions {
+        input_file: file.clone().into(),
+        output_file: Some(out.into()),
+        target: Target::nyxara_x86(),
+        emit_asm: false,
+        keep_intermediates: false,
+        backend,
+    };
+    let result = Driver::compile(options);
+    assert!(result.is_ok(), "Driver failed: {:?}", result.err());
+}
+
+#[test]
+fn test_native_backend_matches_ld_layout() {
+    let src = r#"
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        struct Rect {
+            origin: Point,
+            w: i16,
+            h: i16,
+        }
+
+        fn main() -> i32 {
+            let mut r = Rect { origin: Point { x: 1, y: 2 }, w: 10, h: 20 }
+            r.origin.x = 42
+            r.w = 15
+            let arr: [i32; 4] = [10, 20, 30, 40]
+            let mut sum = 0
+            for (let mut k = 0; k < 4; k = k + 1) {
+                sum = sum + arr[k]
+            }
+            println(itoa(r.origin.x + r.w + sum))
+            return 0
+        }
+    "#;
+    compile_to(src, "target/native_match_gas.elf", Backend::Gas);
+    compile_to(src, "target/native_match_native.elf", Backend::Native);
+
+    let gas = fs::read("target/native_match_gas.elf").expect("gas elf missing");
+    let native = fs::read("target/native_match_native.elf").expect("native elf missing");
+
+    let load_payload = |elf: &[u8]| -> Vec<u8> {
+        let entry = u32::from_le_bytes([elf[24], elf[25], elf[26], elf[27]]);
+        assert_eq!(entry, 0x0400_0000, "entry point must be USER_BASE");
+        let phoff = u32::from_le_bytes([elf[28], elf[29], elf[30], elf[31]]) as usize;
+        let p_offset = u32::from_le_bytes([
+            elf[phoff + 4], elf[phoff + 5], elf[phoff + 6], elf[phoff + 7],
+        ]) as usize;
+        let p_filesz = u32::from_le_bytes([
+            elf[phoff + 16], elf[phoff + 17], elf[phoff + 18], elf[phoff + 19],
+        ]) as usize;
+        elf[p_offset..p_offset + p_filesz].to_vec()
+    };
+    let gas_payload = load_payload(&gas);
+    let native_payload = load_payload(&native);
+    assert!(
+        native_payload.starts_with(&gas_payload),
+        "native payload must match the ld-produced payload byte-for-byte (gas {} bytes, native {} bytes)",
+        gas_payload.len(),
+        native_payload.len()
+    );
+}
+
+#[test]
+fn test_stack_frame_covers_deepest_local() {
+    // Regression: locals must be recorded at their own EBP offsets before the
+    // frame grows, otherwise variables fall outside `sub esp` and get
+    // clobbered by the first push.
+    let src = r#"
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        fn main() -> i32 {
+            let p = Point { x: 1, y: 2 }
+            let arr: [i32; 3] = [1, 2, 3]
+            let mut sum = 0
+            for (let mut k = 0; k < 3; k = k + 1) {
+                sum = sum + arr[k] + p.x
+            }
+            return sum
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    sema.analyze_program(&mut prog).unwrap();
+
+    for item in &prog.items {
+        if let nyxc::ast::Item::Fn(f) = item {
+            let vars = sema.symbols.fn_vars(&f.name);
+            let deepest = vars.iter().map(|(_, off)| *off).min().unwrap_or(0);
+            assert!(
+                f.stack_size as i32 + deepest >= 0,
+                "stack frame {} does not cover the deepest local at {} in '{}'",
+                f.stack_size,
+                deepest,
+                f.name
+            );
+        }
+    }
+}
+
+#[test]
+fn test_native_backend_elf_header() {
+    compile_to("fn main() -> i32 { return 0 }\n", "target/native_header.elf", Backend::Native);
+    let elf = fs::read("target/native_header.elf").expect("native elf missing");
+    assert_eq!(&elf[..4], b"\x7fELF");
+    assert_eq!(elf[4], 1, "ELFCLASS32");
+    assert_eq!(elf[5], 1, "little endian");
+    assert_eq!(u16::from_le_bytes([elf[16], elf[17]]), 2, "ET_EXEC");
+    assert_eq!(u16::from_le_bytes([elf[18], elf[19]]), 3, "EM_386");
+    assert_eq!(u32::from_le_bytes([elf[24], elf[25], elf[26], elf[27]]), 0x0400_0000);
+    assert_eq!(u16::from_le_bytes([elf[44], elf[45]]), 1, "phnum");
 }
