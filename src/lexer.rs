@@ -119,6 +119,7 @@ impl<'a> Lexer<'a> {
                         "import" => TokenKind::Import,
                         "syscall" => TokenKind::Syscall,
                         "extern" => TokenKind::Extern,
+                        "struct" => TokenKind::Struct,
                         "true" => TokenKind::True,
                         "false" => TokenKind::False,
                         "i8" => TokenKind::TypeI8,
@@ -141,6 +142,7 @@ impl<'a> Lexer<'a> {
                 b']' => { self.advance(); tokens.push(Token::new(TokenKind::RBracket, span)); }
                 b',' => { self.advance(); tokens.push(Token::new(TokenKind::Comma, span)); }
                 b';' => { self.advance(); tokens.push(Token::new(TokenKind::Semicolon, span)); }
+                b'.' => { self.advance(); tokens.push(Token::new(TokenKind::Dot, span)); }
                 b'+' => { self.advance(); tokens.push(Token::new(TokenKind::Plus, span)); }
                 b'*' => { self.advance(); tokens.push(Token::new(TokenKind::Star, span)); }
                 b'%' => { self.advance(); tokens.push(Token::new(TokenKind::Percent, span)); }
