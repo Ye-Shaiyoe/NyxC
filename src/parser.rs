@@ -105,6 +105,7 @@ impl Parser {
                 self.parse_fn(true).map(Item::Fn)
             }
             TokenKind::Const => self.parse_const().map(Item::Const),
+            TokenKind::Let => self.parse_let().map(Item::Global),
             TokenKind::Struct => self.parse_struct().map(Item::Struct),
             _ => Err(CompileError::new(
                 "PAR_002",
@@ -315,6 +316,16 @@ impl Parser {
             TokenKind::If => self.parse_if(),
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
+            TokenKind::Break => {
+                let start = self.expect(TokenKind::Break)?.span;
+                self.consume_stmt_terminator();
+                Ok(Stmt::Break { span: start })
+            }
+            TokenKind::Continue => {
+                let start = self.expect(TokenKind::Continue)?.span;
+                self.consume_stmt_terminator();
+                Ok(Stmt::Continue { span: start })
+            }
             TokenKind::LBrace => {
                 let start = self.advance().span;
                 let inner = self.parse_block_stmts()?;
@@ -622,7 +633,16 @@ impl Parser {
                 let inner = self.parse_unary()?;
                 Ok(Expr::Unary(UnaryOp::AddrOf, Box::new(inner), span))
             }
-            _ => self.parse_postfix(),
+            _ => {
+                let expr = self.parse_postfix()?;
+                if self.match_token(TokenKind::Ident("as".into())) {
+                    let span = expr.span();
+                    let target = self.parse_type()?;
+                    Ok(Expr::Cast(Box::new(expr), target, span))
+                } else {
+                    Ok(expr)
+                }
+            }
         }
     }
 
@@ -665,7 +685,15 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, CompileError> {
         let tok = self.advance();
         match tok.kind {
+            TokenKind::Ident(s) if s == "null" => Ok(Expr::Null(tok.span)),
+            TokenKind::Ident(s) if s == "sizeof" => {
+                self.expect(TokenKind::LParen)?;
+                let ty = self.parse_type()?;
+                self.expect(TokenKind::RParen)?;
+                Ok(Expr::Sizeof(ty, tok.span))
+            }
             TokenKind::IntLit(n) => Ok(Expr::IntLit(n, tok.span)),
+            TokenKind::CharLit(c) => Ok(Expr::IntLit(c as i64, tok.span)),
             TokenKind::StringLit(s) => Ok(Expr::StringLit(s, tok.span)),
             TokenKind::True => Ok(Expr::BoolLit(true, tok.span)),
             TokenKind::False => Ok(Expr::BoolLit(false, tok.span)),
