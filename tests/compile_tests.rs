@@ -540,6 +540,122 @@ fn test_stack_frame_covers_deepest_local() {
 }
 
 #[test]
+fn test_global_variable_and_access() {
+    let src = r#"
+        let mut counter: i32 = 0
+        let greeting: *u8 = "hi"
+
+        fn bump(n: i32) -> i32 {
+            counter = counter + n
+            return counter
+        }
+
+        fn main() -> i32 {
+            counter = 5
+            let c = bump(2)
+            return c + counter
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    assert!(sema.analyze_program(&mut prog).is_ok());
+}
+
+#[test]
+fn test_global_duplicate_rejected() {
+    let src = "let mut a: i32 = 0\nlet mut a: i32 = 1\nfn main() -> i32 { return a }\n";
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    let err = sema.analyze_program(&mut prog).unwrap_err();
+    assert_eq!(err.code, "SEM_021");
+}
+
+#[test]
+fn test_immutable_global_assignment_rejected() {
+    let src = "let limit: i32 = 10\nfn main() -> i32 { limit = 20\n return limit }\n";
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    let err = sema.analyze_program(&mut prog).unwrap_err();
+    assert_eq!(err.code, "SEM_004");
+}
+
+#[test]
+fn test_global_needs_type_or_init() {
+    let src = "let mut data\nfn main() -> i32 { return 0 }\n";
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    let err = sema.analyze_program(&mut prog).unwrap_err();
+    assert_eq!(err.code, "SEM_022");
+}
+
+#[test]
+fn test_global_struct_and_array_data() {
+    let src = r#"
+        struct Point { x: i32, y: i32 }
+        let origin: Point = Point { x: 1, y: 2 }
+        let digits: [i32; 3] = [10, 20, 30]
+        fn main() -> i32 {
+            return origin.x + digits[2]
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    assert!(sema.analyze_program(&mut prog).is_ok());
+}
+
+#[test]
+fn test_break_and_continue_in_loop() {
+    let src = r#"
+        fn main() -> i32 {
+            let mut sum = 0
+            for (let mut i = 0; i < 10; i = i + 1) {
+                if i == 2 { continue }
+                if i == 5 { break }
+                sum = sum + i
+            }
+            return sum
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    assert!(sema.analyze_program(&mut prog).is_ok());
+}
+
+#[test]
+fn test_break_outside_loop_rejected() {
+    let src = "fn main() -> i32 { break\n return 0 }\n";
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    let err = sema.analyze_program(&mut prog).unwrap_err();
+    assert_eq!(err.code, "SEM_020");
+}
+
+#[test]
+fn test_char_literal_expression() {
+    let src = "fn main() -> i32 { let c: i32 = 'A'\n return c }\n";
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    assert!(sema.analyze_program(&mut prog).is_ok());
+}
+
+#[test]
+fn test_struct_copy_assignment() {
+    let src = r#"
+        struct Point { x: i32, y: i32 }
+        let origin: Point = Point { x: 1, y: 2 }
+        fn main() -> i32 {
+            let mut p = origin
+            p.x = 9
+            p = origin
+            return p.x
+        }
+    "#;
+    let mut prog = parse(src);
+    let mut sema = SemanticAnalyzer::new();
+    assert!(sema.analyze_program(&mut prog).is_ok());
+}
+
+#[test]
 fn test_native_backend_elf_header() {
     compile_to("fn main() -> i32 { return 0 }\n", "target/native_header.elf", Backend::Native);
     let elf = fs::read("target/native_header.elf").expect("native elf missing");
