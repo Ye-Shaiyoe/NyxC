@@ -116,6 +116,8 @@ impl<'a> Lexer<'a> {
                         "else" => TokenKind::Else,
                         "while" => TokenKind::While,
                         "for" => TokenKind::For,
+                        "break" => TokenKind::Break,
+                        "continue" => TokenKind::Continue,
                         "import" => TokenKind::Import,
                         "syscall" => TokenKind::Syscall,
                         "extern" => TokenKind::Extern,
