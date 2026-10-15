@@ -131,6 +131,13 @@ struct MemOp {
     size: Option<u8>,
 }
 
+impl MemOp {
+    /// A bare `[label]` operand (no base/index register).
+    fn is_absolute(&self) -> bool {
+        self.base.is_none() && self.index.is_none() && self.label.is_some()
+    }
+}
+
 fn modrm(m: u8, reg: u8, rm: u8) -> u8 {
     (m << 6) | ((reg & 7) << 3) | (rm & 7)
 }
@@ -478,13 +485,25 @@ fn encode(
                     out.push(0x89);
                     emit_rm_any(&mut out, as_reg(src)?.code(), dst, resolve)?;
                 }
-                (Operand::Reg(r), Operand::Mem(_)) => {
-                    out.push(0x8B);
-                    emit_rm_any(&mut out, r.code(), src, resolve)?;
+                (Operand::Reg(r), Operand::Mem(m)) => {
+                    // mov eax, moffs32 uses the short A1 form
+                    if *r == Reg::Eax && size == 4 && m.is_absolute() {
+                        out.push(0xA1);
+                        out.extend_from_slice(&resolve(m.label.as_deref().unwrap()).to_le_bytes());
+                    } else {
+                        out.push(if size == 1 { 0x8A } else { 0x8B });
+                        emit_rm_any(&mut out, r.code(), src, resolve)?;
+                    }
                 }
-                (Operand::Mem(_), Operand::Reg(r)) => {
-                    out.push(if size == 1 { 0x88 } else { 0x89 });
-                    emit_rm_any(&mut out, r.code(), dst, resolve)?;
+                (Operand::Mem(m), Operand::Reg(r)) => {
+                    if *r == Reg::Eax && size == 4 && m.is_absolute() {
+                        // mov moffs32, eax uses the short A3 form
+                        out.push(0xA3);
+                        out.extend_from_slice(&resolve(m.label.as_deref().unwrap()).to_le_bytes());
+                    } else {
+                        out.push(if size == 1 { 0x88 } else { 0x89 });
+                        emit_rm_any(&mut out, r.code(), dst, resolve)?;
+                    }
                 }
                 _ => {
                     return Err(CompileError::new(
@@ -760,8 +779,16 @@ enum Line {
     Label(String),
     Instr(String, Vec<Operand>),
     Bytes(Vec<u8>),
+    Words(Vec<i64>),
+    Longs(Vec<LongItem>),
     Space(usize),
     Directive(Section),
+}
+
+#[derive(Clone, Debug)]
+enum LongItem {
+    Label(String),
+    Int(i64),
 }
 
 fn parse_line(line: &str) -> Result<Option<Line>, CompileError> {
@@ -811,6 +838,34 @@ fn parse_line(line: &str) -> Result<Option<Line>, CompileError> {
                     bytes.push(n as i8 as u8);
                 }
                 Ok(Some(Line::Bytes(bytes)))
+            }
+            "word" => {
+                let mut words = Vec::new();
+                for part in arg.split(',') {
+                    let n = parse_int(part.trim()).ok_or_else(|| {
+                        CompileError::new("GEN_010", "malformed .word directive", None)
+                    })?;
+                    words.push(n);
+                }
+                Ok(Some(Line::Words(words)))
+            }
+            "long" => {
+                let mut items = Vec::new();
+                for part in arg.split(',') {
+                    let part = part.trim();
+                    match parse_int(part) {
+                        Some(n) => items.push(LongItem::Int(n)),
+                        None if !part.is_empty() => items.push(LongItem::Label(part.to_string())),
+                        None => {
+                            return Err(CompileError::new(
+                                "GEN_010",
+                                "malformed .long directive",
+                                None,
+                            ))
+                        }
+                    }
+                }
+                Ok(Some(Line::Longs(items)))
             }
             "space" => {
                 let n = parse_int(arg).ok_or_else(|| {
@@ -896,6 +951,8 @@ pub fn assemble(source: &str) -> Result<Sections, CompileError> {
                     round_labels.insert(name.clone(), (*section, round_sizes[idx].1));
                 }
                 Line::Bytes(bytes) => round_sizes[idx].1 += bytes.len() as u32,
+                Line::Words(words) => round_sizes[idx].1 += (words.len() * 2) as u32,
+                Line::Longs(items) => round_sizes[idx].1 += (items.len() * 4) as u32,
                 Line::Space(n) => round_sizes[idx].1 += *n as u32,
                 Line::Instr(mnemonic, ops) => {
                     let cur = address_of(*section, round_sizes[idx].1, &sizes);
@@ -938,18 +995,32 @@ pub fn assemble(source: &str) -> Result<Sections, CompileError> {
             Section::Data => &mut sections.data,
         };
         let current_len = target.len() as u32;
+        let resolver = |name: &str| -> u32 {
+            labels
+                .get(name)
+                .map(|(s, off)| address_of(*s, *off, &aligned_sizes))
+                .unwrap_or(0)
+        };
         match line {
             Line::Label(_) => {}
             Line::Bytes(bytes) => target.extend_from_slice(bytes),
+            Line::Words(words) => {
+                for w in words {
+                    target.extend_from_slice(&(*w as u16).to_le_bytes());
+                }
+            }
+            Line::Longs(items) => {
+                for item in items {
+                    let value = match item {
+                        LongItem::Int(n) => *n as u32,
+                        LongItem::Label(label) => resolver(label),
+                    };
+                    target.extend_from_slice(&value.to_le_bytes());
+                }
+            }
             Line::Space(n) => target.resize(target.len() + n, 0),
             Line::Instr(mnemonic, ops) => {
                 let insn_addr = address_of(*section, current_len, &aligned_sizes);
-                let resolver = |name: &str| -> u32 {
-                    labels
-                        .get(name)
-                        .map(|(s, off)| address_of(*s, *off, &aligned_sizes))
-                        .unwrap_or(0)
-                };
                 let bytes = encode(mnemonic, ops, insn_addr, true, &resolver)?;
                 target.extend_from_slice(&bytes);
             }
