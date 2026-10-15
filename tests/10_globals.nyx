@@ -1,0 +1,61 @@
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+let mut counter: i32 = 0
+let origin: Point = Point { x: 1, y: 2 }
+let digits: [i32; 4] = [10, 20, 30, 40]
+let greeting: *u8 = "globals work"
+
+fn bump(n: i32) -> i32 {
+    counter = counter + n
+    return counter
+}
+
+fn main() -> i32 {
+    println(greeting)
+
+    bump(5)
+    bump(7)
+    println(itoa(counter))
+
+    let mut p = origin
+    p.x = 100
+    println(itoa(p.x))
+    p = origin
+    println(itoa(p.x))
+    println(itoa(origin.x))
+
+    let mut sum = 0
+    for (let mut i = 0; i < 4; i = i + 1) {
+        sum = sum + digits[i]
+    }
+    println(itoa(sum))
+
+    let mut found = 0
+    for (let mut i = 0; i < 10; i = i + 1) {
+        if i == 3 {
+            continue
+        }
+        if i == 6 {
+            break
+        }
+        found = found + i
+    }
+    println(itoa(found))
+
+    let c: i32 = 'A'
+    println(itoa(c))
+
+    let mut n = 0
+    while true {
+        n = n + 1
+        if n > 4 {
+            break
+        }
+    }
+    println(itoa(n))
+
+    return counter + found + c + sum
+}
