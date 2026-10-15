@@ -10,6 +10,7 @@ use self::types::{int_fits, is_assignable};
 pub struct SemanticAnalyzer {
     pub symbols: SymbolTable,
     pub has_sys_import: bool,
+    loop_depth: usize,
 }
 
 impl SemanticAnalyzer {
@@ -93,6 +94,7 @@ impl SemanticAnalyzer {
         Self {
             symbols,
             has_sys_import: false,
+            loop_depth: 0,
         }
     }
 
@@ -124,6 +126,16 @@ impl SemanticAnalyzer {
                     }
                     self.symbols.register_struct(def.clone());
                 }
+                Item::Global(Stmt::Let {
+                    name,
+                    is_mut,
+                    ty,
+                    init,
+                    span,
+                }) => {
+                    self.analyze_global(name, *is_mut, ty.as_ref(), init.as_ref(), *span)?;
+                }
+                Item::Global(_) => {}
                 Item::Const(Stmt::Const { name, ty, init, span }) => {
                     self.analyze_const(name, ty.as_ref(), init, *span)?;
                 }
@@ -196,6 +208,15 @@ impl SemanticAnalyzer {
             Expr::BoolLit(b, _) => Ok((Type::Bool, ConstValue::Bool(*b))),
             Expr::StringLit(s, _) => {
                 Ok((Type::Pointer(Box::new(Type::U8)), ConstValue::Str(s.clone())))
+            }
+            Expr::Null(_) => Ok((Type::Pointer(Box::new(Type::U8)), ConstValue::Int(0))),
+            Expr::Sizeof(ty, _) => Ok((
+                Type::I32,
+                ConstValue::Int(ty.size_in_bytes(&self.symbols.structs) as i64),
+            )),
+            Expr::Cast(inner, _, _) => {
+                let (_, value) = self.eval_const_expr(inner)?;
+                Ok((Type::I32, value))
             }
             Expr::Ident(name, span) => {
                 if let Some(cs) = self.symbols.lookup_const(name) {
@@ -314,6 +335,46 @@ impl SemanticAnalyzer {
                     )),
                 }
             }
+            Expr::ArrayLit(elems, _span) => {
+                let mut values = Vec::with_capacity(elems.len());
+                let mut elem_ty = Type::I32;
+                for (i, elem) in elems.iter().enumerate() {
+                    let (ty, value) = self.eval_const_expr(elem)?;
+                    if i == 0 {
+                        elem_ty = ty;
+                    }
+                    values.push(value);
+                }
+                Ok((
+                    Type::Array(Box::new(elem_ty), elems.len()),
+                    ConstValue::Array(values),
+                ))
+            }
+            Expr::StructLit(name, inits, span) => {
+                let def = self
+                    .symbols
+                    .lookup_struct(name)
+                    .ok_or_else(|| {
+                        CompileError::new(
+                            "SEM_018",
+                            format!("unknown struct '{}' in literal", name),
+                            Some(*span),
+                        )
+                    })?
+                    .clone();
+                let mut fields = Vec::with_capacity(inits.len());
+                for (field_name, value) in inits {
+                    if !def.fields.iter().any(|f| f.name == *field_name) {
+                        return Err(CompileError::new(
+                            "SEM_017",
+                            format!("struct '{}' has no field '{}'", name, field_name),
+                            Some(*span),
+                        ));
+                    }
+                    fields.push((field_name.clone(), self.eval_const_expr(value)?.1));
+                }
+                Ok((Type::Struct(name.clone()), ConstValue::Struct(fields)))
+            }
             _ => Err(CompileError::new(
                 "SEM_003",
                 "expression is not a valid constant",
@@ -328,6 +389,13 @@ impl SemanticAnalyzer {
         if let Expr::IntLit(n, _) = value {
             if int_fits(target, *n) {
                 return Ok(());
+            }
+        }
+        if let Expr::Unary(UnaryOp::Neg, box_expr, _) = value {
+            if let Expr::IntLit(n, _) = box_expr.as_ref() {
+                if int_fits(target, -*n) {
+                    return Ok(());
+                }
             }
         }
         if let (Type::Array(elem, len), Expr::ArrayLit(elems, _)) = (target, value) {
@@ -357,6 +425,47 @@ impl SemanticAnalyzer {
 
     /// Walks an assignment target (variable, field, index, deref) and rejects
     /// writes to constants and immutable variables at the root.
+    fn analyze_global(
+        &mut self,
+        name: &str,
+        is_mut: bool,
+        ty: Option<&Type>,
+        init: Option<&Expr>,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        if self.symbols.lookup_global(name).is_some() {
+            return Err(CompileError::new(
+                "SEM_021",
+                format!("duplicate global '{}'", name),
+                Some(span),
+            ));
+        }
+
+        let value = match init {
+            Some(expr) => Some(self.eval_const_expr(expr)?.1),
+            None => None,
+        };
+        let final_ty = match (ty, init) {
+            (Some(explicit_ty), _) => explicit_ty.clone(),
+            (None, Some(expr)) => self.type_of_expr(expr)?,
+            (None, None) => {
+                return Err(CompileError::new(
+                    "SEM_022",
+                    format!("global '{}' needs a type annotation or an initializer", name),
+                    Some(span),
+                ))
+            }
+        };
+
+        self.symbols.register_global(crate::sema::symbols::GlobalSymbol {
+            name: name.to_string(),
+            ty: final_ty,
+            is_mut,
+            init: value,
+        });
+        Ok(())
+    }
+
     fn check_mut_target(&self, target: &Expr) -> Result<(), CompileError> {
         match target {
             Expr::Ident(name, span) => {
@@ -372,6 +481,15 @@ impl SemanticAnalyzer {
                         return Err(CompileError::new(
                             "SEM_004",
                             format!("cannot assign twice to immutable variable '{}'", name),
+                            Some(*span),
+                        ));
+                    }
+                }
+                if let Some(g) = self.symbols.lookup_global(name) {
+                    if !g.is_mut {
+                        return Err(CompileError::new(
+                            "SEM_004",
+                            format!("cannot assign to immutable global '{}'", name),
                             Some(*span),
                         ));
                     }
@@ -420,6 +538,34 @@ impl SemanticAnalyzer {
 
         Ok(())
     }
+    fn is_castable(source: &Type, target: &Type) -> bool {
+        if source == target {
+            return true;
+        }
+        let source_integral = matches!(
+            source,
+            Type::I8 | Type::I16 | Type::I32 | Type::U8 | Type::U16 | Type::U32 | Type::Bool
+        );
+        let target_integral = matches!(
+            target,
+            Type::I8 | Type::I16 | Type::I32 | Type::U8 | Type::U16 | Type::U32 | Type::Bool
+        );
+        if source_integral && target_integral {
+            return true;
+        }
+        if let (Type::Pointer(_), Type::Pointer(_)) = (source, target) {
+            return true;
+        }
+        match (source, target) {
+            (Type::Pointer(_), Type::I32) | (Type::Pointer(_), Type::U32)
+            | (Type::I32, Type::Pointer(_)) | (Type::U32, Type::Pointer(_))
+            | (Type::Pointer(_), Type::Bool) | (Type::Bool, Type::Pointer(_)) => {
+                true
+            }
+            _ => false,
+        }
+    }
+
 
     fn analyze_stmt(
         &mut self,
@@ -520,8 +666,19 @@ impl SemanticAnalyzer {
                         Some(*span),
                     ));
                 }
+                self.loop_depth += 1;
                 for s in body {
                     self.analyze_stmt(s, fn_name, expected_ret, local_offset)?;
+                }
+                self.loop_depth -= 1;
+            }
+            Stmt::Break { span } | Stmt::Continue { span } => {
+                if self.loop_depth == 0 {
+                    return Err(CompileError::new(
+                        "SEM_020",
+                        "break/continue outside of a loop",
+                        Some(*span),
+                    ));
                 }
             }
             Stmt::Block(stmts, _) => {
@@ -532,49 +689,19 @@ impl SemanticAnalyzer {
                 self.symbols.exit_scope();
             }
             Stmt::For { init, cond, step, body, span } => {
-                self.symbols.enter_scope();
-                // 1. Analyze init
-                match init.as_ref() {
-                    Stmt::LetWrapper(inner) => {
-                        self.analyze_stmt(inner, fn_name, expected_ret, local_offset)?;
-                    }
-                    Stmt::ExprInit(e, _) => {
-                        let _ = self.type_of_expr(e)?;
-                    }
-                    _ => {}
-                }
-                // 2. Analyze condition
-                let cond_ty = match self.type_of_expr(cond) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        self.symbols.exit_scope();
-                        return Err(e);
-                    }
-                };
-                if !matches!(cond_ty, Type::Bool | Type::I32 | Type::U32 | Type::Pointer(_)) {
-                    self.symbols.exit_scope();
-                    return Err(CompileError::new(
-                        "SEM_008",
-                        format!(
-                            "for condition must be a bool, integer, or pointer, found {}",
-                            cond_ty.name()
-                        ),
-                        Some(*span),
-                    ));
-                }
-                // 3. Analyze step expression
-                if let Err(e) = self.type_of_expr(step) {
-                    self.symbols.exit_scope();
-                    return Err(e);
-                }
-                // 4. Analyze body statements
-                for s in body {
-                    if let Err(e) = self.analyze_stmt(s, fn_name, expected_ret, local_offset) {
-                        self.symbols.exit_scope();
-                        return Err(e);
-                    }
-                }
-                self.symbols.exit_scope();
+                self.loop_depth += 1;
+                let result = self.analyze_for(
+                    init,
+                    cond,
+                    step,
+                    body,
+                    *span,
+                    fn_name,
+                    expected_ret,
+                    local_offset,
+                );
+                self.loop_depth -= 1;
+                result?;
             }
             Stmt::LetWrapper(inner) => {
                 let _ = self.analyze_stmt(inner, fn_name, expected_ret, local_offset)?;
@@ -589,16 +716,90 @@ impl SemanticAnalyzer {
         Ok(())
     }
 
+    fn analyze_for(
+        &mut self,
+        init: &Stmt,
+        cond: &Expr,
+        step: &Expr,
+        body: &[Stmt],
+        span: Span,
+        fn_name: &str,
+        expected_ret: &Type,
+        local_offset: &mut i32,
+    ) -> Result<(), CompileError> {
+        self.symbols.enter_scope();
+        // 1. Analyze init
+        match init {
+            Stmt::LetWrapper(inner) => {
+                self.analyze_stmt(inner, fn_name, expected_ret, local_offset)?;
+            }
+            Stmt::ExprInit(e, _) => {
+                let _ = self.type_of_expr(e)?;
+            }
+            _ => {}
+        }
+        // 2. Analyze condition
+        let cond_ty = self.type_of_expr(cond)?;
+        if !matches!(cond_ty, Type::Bool | Type::I32 | Type::U32 | Type::Pointer(_)) {
+            self.symbols.exit_scope();
+            return Err(CompileError::new(
+                "SEM_008",
+                format!(
+                    "for condition must be a bool, integer, or pointer, found {}",
+                    cond_ty.name()
+                ),
+                Some(span),
+            ));
+        }
+        // 3. Analyze step expression
+        if let Err(e) = self.type_of_expr(step) {
+            self.symbols.exit_scope();
+            return Err(e);
+        }
+        // 4. Analyze body statements
+        for s in body {
+            if let Err(e) = self.analyze_stmt(s, fn_name, expected_ret, local_offset) {
+                self.symbols.exit_scope();
+                return Err(e);
+            }
+        }
+        self.symbols.exit_scope();
+        Ok(())
+    }
+
     pub fn type_of_expr(&self, expr: &Expr) -> Result<Type, CompileError> {
         match expr {
             Expr::IntLit(_, _) => Ok(Type::I32),
             Expr::StringLit(_, _) => Ok(Type::Pointer(Box::new(Type::U8))),
             Expr::BoolLit(_, _) => Ok(Type::Bool),
+            Expr::Null(_) => Ok(Type::Pointer(Box::new(Type::U8))),
+            Expr::Sizeof(ty, _) => {
+                let _ = ty;
+                Ok(Type::I32)
+            }
+            Expr::Cast(expr, target, span) => {
+                let source = self.type_of_expr(expr)?;
+                if Self::is_castable(&source, target) {
+                    Ok(target.clone())
+                } else {
+                    Err(CompileError::new(
+                        "SEM_023",
+                        format!(
+                            "cannot cast from {} to {}",
+                            source.name(),
+                            target.name()
+                        ),
+                        Some(*span),
+                    ))
+                }
+            }
             Expr::Ident(name, span) => {
                 if let Some(sym) = self.symbols.lookup_var(name) {
                     Ok(sym.ty.clone())
                 } else if let Some(cs) = self.symbols.lookup_const(name) {
                     Ok(cs.ty.clone())
+                } else if let Some(g) = self.symbols.lookup_global(name) {
+                    Ok(g.ty.clone())
                 } else {
                     Err(CompileError::new(
                         "SEM_001",
