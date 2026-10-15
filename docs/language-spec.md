@@ -15,8 +15,11 @@ Semicolons (`;`) are optional. Statements may be terminated by explicit semicolo
 ## 2. Primitive Types
 - Integers: `i8`, `i16`, `i32`, `u8`, `u16`, `u32`
 - Boolean: `bool` (`true`, `false`)
+- Character: `char` (written `'A'`; used as an integral value in expressions)
 - Void: `void`
 - Pointers: `*T` (e.g. `*u8`, `*i32`, `**u8`)
+- Fixed arrays: `[T; N]` (e.g. `[i32; 8]`)
+- Structs: user-defined records (`struct P { x: i32, y: i32 }`)
 
 ## 3. Declarations
 
@@ -51,6 +54,35 @@ const BUFFER_SIZE = 1024
 extern fn sys_write(fd: i32, buf: *u8, len: i32) -> i32
 ```
 
+### Global Variables
+Top-level `let` declares a global variable stored in the `.data` section and
+addressed absolutely (no EBP frame). The initializer must be a compile-time
+constant; without an initializer the storage is zero-filled:
+```nyx
+let mut counter: i32 = 0
+let mut buffer: [u8; 256]
+let greeting: *u8 = "ready"
+let origin: Point = Point { x: 1, y: 2 }
+```
+
+Assigning to a global requires `mut` (same rule as locals). Globals are
+shared by all functions, which makes them the natural home for fixed-size
+compiler tables.
+
+### Structs and Arrays
+```nyx
+struct Point { x: i32, y: i32 }
+
+let mut p: Point = Point { x: 1, y: 2 }
+p.x = 10
+
+let mut a: [i32; 8]
+let mut b: [i32; 4] = [1, 2, 3, 4]
+let q: Point = p
+```
+Indexing `a[i]` and field access `p.x` are first-class expressions. Full
+array and whole-struct assignment copies the aggregate.
+
 ## 4. Control Flow
 
 ### If / Else
@@ -61,6 +93,21 @@ if x > 0 {
     sys::write(1, "zero or negative\n", 17)
 }
 ```
+
+### While, For, `break`, and `continue`
+```nyx
+while n < 10 {
+    n = n + 1
+    if n == 5 { continue }
+}
+
+let i: i32
+for (i = 0; i < n; i = i + 1) {
+    sum = sum + i
+    if sum > 100 { break }
+}
+```
+`break` and `continue` are valid only inside `while` and `for`.
 
 ### While
 ```nyx
@@ -75,6 +122,9 @@ while counter < 10 {
 - Logical: `&&`, `||`, `!`
 - Bitwise: `&`, `|`, `^`, `~`, `<<`, `>>`
 - Pointer operations: `&x` (address-of), `*ptr` (dereference)
+- Explicit cast: `x as T` (integral, boolean, or pointer forms)
+- Null pointer: `null`
+- Compile-time builtin: `sizeof(T)` (size of a type)
 
 ## 6. Built-in Functions
 Compiler built-ins, always available without an import:

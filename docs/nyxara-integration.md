@@ -8,7 +8,8 @@ NyxaraOS uses an embedded userland image loaded into memory via `rust/src/initrd
 Compile any `.nyx` source using the NyxC compiler:
 ```bash
 cd /home/akrom/Projects/NyxC
-cargo run --release -- build hello.nyx -o hello.elf
+cargo run --release -- build hello.nyx -o hello.elf            # GNU as/ld backend
+cargo run --release -- build hello.nyx -o hello.elf --backend native  # internal encoder
 ```
 
 ### 2. Copy Binary to NyxaraOS Build Directory

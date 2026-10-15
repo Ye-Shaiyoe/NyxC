@@ -17,13 +17,13 @@ NyxC is an ahead-of-time (AOT) systems programming language compiler targeting *
         ▼ (Semantic Analyzer & Type Checker)
    [ Validated Typed AST & Symbol Tables ]
         │
-        ▼ (Codegen: x86_gas)
-   [ x86-32 Assembly (Intel Syntax) ] (.section .text, .rodata, _start)
+        ▼ (Codegen: x86_gas / internal native encoder)
+   [ x86-32 Assembly / encoded ELF32 image ] (.text, .rodata, .data, _start)
         │
-        ▼ (GNU Assembler: as --32)
-   [ ELF32 Object File (.o) ]
+        ├── gas backend: as --32 then ld (GNU toolchain)
+        └── native backend: two-pass x86 encoder + built-in ELF32 writer
         │
-        ▼ (GNU Linker: ld -m elf_i386 -T runtime/user.ld -nostdlib)
+        ▼
    [ NyxaraOS Userland Executable (.elf) ] (Base 0x04000000)
 ```
 
