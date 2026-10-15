@@ -11,6 +11,7 @@ pub struct X86GasCodegen<'a> {
     current_fn_name: Option<String>,
     has_itoa: bool,
     has_println: bool,
+    loop_stack: Vec<(String, String)>, // (break target, continue target)
 }
 
 impl<'a> X86GasCodegen<'a> {
@@ -23,7 +24,12 @@ impl<'a> X86GasCodegen<'a> {
             current_fn_name: None,
             has_itoa: false,
             has_println: false,
+            loop_stack: Vec::new(),
         }
+    }
+
+    fn global_label(name: &str) -> String {
+        format!("g_{}", name)
     }
 
     fn lookup_var(&self, name: &str) -> Option<&crate::sema::symbols::Symbol> {
@@ -55,6 +61,13 @@ impl<'a> X86GasCodegen<'a> {
         let mut text_section = String::new();
         let mut has_main = false;
         let mut has_start = false;
+        let mut global_data = String::new();
+
+        for item in &program.items {
+            if let Item::Global(stmt) = item {
+                global_data.push_str(&self.generate_global_decl(stmt)?);
+            }
+        }
 
         for item in &program.items {
             if let Item::Fn(f) = item {
@@ -85,8 +98,8 @@ impl<'a> X86GasCodegen<'a> {
             output.push('\n');
         }
 
-        // Writable data section for the itoa result buffer and println newline
-        if self.has_itoa || self.has_println {
+        // Writable data section: itoa buffer, println newline, then globals
+        if self.has_itoa || self.has_println || !global_data.is_empty() {
             output.push_str(".section .data\n");
             if self.has_itoa {
                 output.push_str(".nyx_itoa_buf:\n");
@@ -96,6 +109,7 @@ impl<'a> X86GasCodegen<'a> {
                 output.push_str(".nyx_newline:\n");
                 output.push_str("    .byte 10\n");
             }
+            output.push_str(&global_data);
             output.push('\n');
         }
 
@@ -217,9 +231,23 @@ impl<'a> X86GasCodegen<'a> {
                             }
                         }
                         _ => {
-                            asm.push_str(&self.generate_expr(init_expr)?);
-                            if let Some(sym) = self.lookup_var(name) {
-                                asm.push_str(&format!("    mov [ebp + ({})], eax\n", sym.offset));
+                            let init_ty = self.type_of(init_expr)?;
+                            if init_ty.size_in_bytes(&self.analyzer.symbols.structs) > 4 {
+                                if let Some(sym) = self.lookup_var(name) {
+                                    self.copy_into_slot(
+                                        &format!("[ebp + ({})]", sym.offset),
+                                        init_expr,
+                                        &mut asm,
+                                    )?;
+                                }
+                            } else {
+                                asm.push_str(&self.generate_expr(init_expr)?);
+                                if let Some(sym) = self.lookup_var(name) {
+                                    asm.push_str(&format!(
+                                        "    mov [ebp + ({})], eax\n",
+                                        sym.offset
+                                    ));
+                                }
                             }
                         }
                     }
@@ -267,12 +295,34 @@ impl<'a> X86GasCodegen<'a> {
                 asm.push_str("    test eax, eax\n");
                 asm.push_str(&format!("    jz {}\n", loop_end));
 
+                self.loop_stack.push((loop_end.clone(), loop_start.clone()));
                 for s in body {
                     asm.push_str(&self.generate_stmt(s)?);
                 }
+                self.loop_stack.pop();
 
                 asm.push_str(&format!("    jmp {}\n", loop_start));
                 asm.push_str(&format!("{}:\n", loop_end));
+            }
+            Stmt::Break { .. } => {
+                let target = self
+                    .loop_stack
+                    .last()
+                    .map(|(end, _)| end.clone())
+                    .ok_or_else(|| {
+                        CompileError::new("SEM_020", "break outside of a loop", None)
+                    })?;
+                asm.push_str(&format!("    jmp {}\n", target));
+            }
+            Stmt::Continue { .. } => {
+                let target = self
+                    .loop_stack
+                    .last()
+                    .map(|(_, step)| step.clone())
+                    .ok_or_else(|| {
+                        CompileError::new("SEM_020", "continue outside of a loop", None)
+                    })?;
+                asm.push_str(&format!("    jmp {}\n", target));
             }
             Stmt::Block(stmts, _) => {
                 for s in stmts {
@@ -281,6 +331,7 @@ impl<'a> X86GasCodegen<'a> {
             }
             Stmt::For { init, cond, step, body, .. } => {
                 let loop_start = self.new_label("for_start");
+                let loop_step = self.new_label("for_step");
                 let loop_end = self.new_label("for_end");
 
                 // Execute init statement once (before the loop)
@@ -293,14 +344,15 @@ impl<'a> X86GasCodegen<'a> {
                 asm.push_str(&format!("    jz {}\n", loop_end));
 
                 // Body
+                self.loop_stack.push((loop_end.clone(), loop_step.clone()));
                 for s in body {
                     asm.push_str(&self.generate_stmt(s)?);
                 }
+                self.loop_stack.pop();
 
-                // Step expression (e.g., increment)
+                // Step expression (e.g., increment), then back to the condition
+                asm.push_str(&format!("{}:\n", loop_step));
                 asm.push_str(&self.generate_expr(step)?);
-
-                // Jump back to condition check
                 asm.push_str(&format!("    jmp {}\n", loop_start));
                 asm.push_str(&format!("{}:\n", loop_end));
             }
@@ -326,6 +378,44 @@ impl<'a> X86GasCodegen<'a> {
             Expr::BoolLit(b, _) => {
                 asm.push_str(&format!("    mov eax, {}\n", if *b { 1 } else { 0 }));
             }
+            Expr::Null(_) => {
+                asm.push_str("    mov eax, 0\n");
+            }
+            Expr::Sizeof(ty, span) => {
+                let size = ty.size_in_bytes(&self.analyzer.symbols.structs) as i32;
+                if size == 0 {
+                    return Err(CompileError::new(
+                        "GEN_013",
+                        "sizeof cannot be evaluated to zero bytes",
+                        Some(*span),
+                    ));
+                }
+                asm.push_str(&format!("    mov eax, {}\n", size));
+            }
+            Expr::Cast(expr, target, _) => {
+                let mut inner = self.generate_expr(expr)?;
+                match target {
+                    Type::Bool => {
+                        inner.push_str("    test eax, eax\n");
+                        inner.push_str("    setne al\n");
+                        inner.push_str("    movzx eax, al\n");
+                    }
+                    Type::I8 => {
+                        inner.push_str("    movsx eax, al\n");
+                    }
+                    Type::U8 => {
+                        inner.push_str("    and eax, 0xFF\n");
+                    }
+                    Type::I16 => {
+                        inner.push_str("    movsx eax, ax\n");
+                    }
+                    Type::U16 => {
+                        inner.push_str("    and eax, 0xFFFF\n");
+                    }
+                    _ => {}
+                }
+                asm = inner;
+            }
             Expr::StringLit(s, _) => {
                 let str_id = self.add_string_literal(s);
                 asm.push_str(&format!("    lea eax, [.LC{}]\n", str_id));
@@ -333,6 +423,11 @@ impl<'a> X86GasCodegen<'a> {
             Expr::Ident(name, span) => {
                 if let Some(sym) = self.lookup_var(name) {
                     asm.push_str(&format!("    mov eax, [ebp + ({})]\n", sym.offset));
+                } else if let Some(g) = self.analyzer.symbols.lookup_global(name) {
+                    asm.push_str(&format!(
+                        "    mov eax, [{}]\n",
+                        Self::global_label(&g.name)
+                    ));
                 } else if let Some(cs) = self.analyzer.symbols.lookup_const(name) {
                     use crate::sema::symbols::ConstValue;
                     match &cs.value {
@@ -343,6 +438,16 @@ impl<'a> X86GasCodegen<'a> {
                         ConstValue::Str(s) => {
                             let str_id = self.add_string_literal(s);
                             asm.push_str(&format!("    lea eax, [.LC{}]\n", str_id));
+                        }
+                        ConstValue::Array(_) | ConstValue::Struct(_) => {
+                            return Err(CompileError::new(
+                                "GEN_012",
+                                format!(
+                                    "aggregate constant '{}' cannot be used as a scalar value",
+                                    name
+                                ),
+                                Some(*span),
+                            ));
                         }
                     }
                 } else {
@@ -417,11 +522,21 @@ impl<'a> X86GasCodegen<'a> {
                     self.generate_aggregate_assign(target, value, &mut asm)?;
                     return Ok(asm);
                 }
+                let target_ty = self.type_of(target)?;
+                if target_ty.size_in_bytes(&self.analyzer.symbols.structs) > 4 {
+                    self.copy_aggregate_assign(target, value, &mut asm)?;
+                    return Ok(asm);
+                }
                 asm.push_str(&self.generate_expr(value)?);
                 match &**target {
                     Expr::Ident(name, target_span) => {
                         if let Some(sym) = self.lookup_var(name) {
                             asm.push_str(&format!("    mov [ebp + ({})], eax\n", sym.offset));
+                        } else if let Some(g) = self.analyzer.symbols.lookup_global(name) {
+                            asm.push_str(&format!(
+                                "    mov [{}], eax\n",
+                                Self::global_label(&g.name)
+                            ));
                         } else {
                             return Err(CompileError::new(
                                 "GEN_002",
@@ -459,6 +574,11 @@ impl<'a> X86GasCodegen<'a> {
                     Expr::Ident(name, ident_span) => {
                         if let Some(sym) = self.lookup_var(name) {
                             asm.push_str(&format!("    lea eax, [ebp + ({})]\n", sym.offset));
+                        } else if let Some(g) = self.analyzer.symbols.lookup_global(name) {
+                            asm.push_str(&format!(
+                                "    lea eax, [{}]\n",
+                                Self::global_label(&g.name)
+                            ));
                         } else {
                             return Err(CompileError::new(
                                 "GEN_002",
@@ -666,11 +786,14 @@ impl<'a> X86GasCodegen<'a> {
 
     fn type_of(&self, expr: &Expr) -> Result<Type, CompileError> {
         match expr {
-            Expr::IntLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) => Ok(match expr {
+            Expr::IntLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::Null(_) => Ok(match expr {
                 Expr::StringLit(..) => Type::Pointer(Box::new(Type::U8)),
                 Expr::BoolLit(..) => Type::Bool,
+                Expr::Null(_) => Type::Pointer(Box::new(Type::U8)),
                 _ => Type::I32,
             }),
+            Expr::Sizeof(_, _) => Ok(Type::I32),
+            Expr::Cast(_, target, _) => Ok(target.clone()),
             Expr::Ident(name, span) => self
                 .lookup_var(name)
                 .map(|sym| sym.ty.clone())
@@ -680,12 +803,14 @@ impl<'a> X86GasCodegen<'a> {
                         .lookup_const(name)
                         .map(|cs| cs.ty.clone())
                 })
+                .or_else(|| {
+                    self.analyzer
+                        .symbols
+                        .lookup_global(name)
+                        .map(|g| g.ty.clone())
+                })
                 .ok_or_else(|| {
-                    CompileError::new(
-                        "GEN_001",
-                        format!("unknown variable '{}'", name),
-                        Some(*span),
-                    )
+                    CompileError::new("GEN_001", format!("unknown variable '{}'", name), Some(*span))
                 }),
             Expr::Field(base, field, span) => {
                 let ty = self.type_of(base)?;
@@ -857,10 +982,17 @@ impl<'a> X86GasCodegen<'a> {
     fn generate_addr(&mut self, expr: &Expr, asm: &mut String) -> Result<(), CompileError> {
         match expr {
             Expr::Ident(name, span) => {
-                let sym = self.lookup_var(name).ok_or_else(|| {
-                    CompileError::new("GEN_001", format!("unknown variable '{}'", name), Some(*span))
-                })?;
-                asm.push_str(&format!("    lea eax, [ebp + ({})]\n", sym.offset));
+                if let Some(sym) = self.lookup_var(name) {
+                    asm.push_str(&format!("    lea eax, [ebp + ({})]\n", sym.offset));
+                } else if let Some(g) = self.analyzer.symbols.lookup_global(name) {
+                    asm.push_str(&format!("    lea eax, [{}]\n", Self::global_label(&g.name)));
+                } else {
+                    return Err(CompileError::new(
+                        "GEN_001",
+                        format!("unknown variable '{}'", name),
+                        Some(*span),
+                    ));
+                }
                 Ok(())
             }
             Expr::Field(base, field, span) => {
@@ -1128,6 +1260,176 @@ impl<'a> X86GasCodegen<'a> {
             asm.push_str("    mov edx, [esp]\n");
             self.emit_store_to_edx(elem_ty, (i * elem_size) as i32, asm);
         }
+        Ok(())
+    }
+
+    /// Address of the storage backing an expression value: lvalues use their
+    /// address, anything else must already evaluate to a pointer.
+    fn addr_of_value(&mut self, value: &Expr, asm: &mut String) -> Result<(), CompileError> {
+        match value {
+            Expr::Ident(..) | Expr::Field(..) | Expr::Index(..) => {
+                self.generate_addr(value, asm)?;
+            }
+            _ => asm.push_str(&self.generate_expr(value)?),
+        }
+        Ok(())
+    }
+
+    /// Copies `size` bytes from ebx (source) to eax (destination), byte by byte.
+    fn emit_copy_loop(&mut self, asm: &mut String, size: usize) {
+        let loop_lbl = self.new_label("copy");
+        let done_lbl = self.new_label("copy_done");
+        asm.push_str(&format!(
+            "    mov ecx, {}\n{}:\n    mov dl, [ebx]\n    mov [eax], dl\n    inc ebx\n    inc eax\n    dec ecx\n    jnz {}\n{}:\n",
+            size, loop_lbl, loop_lbl, done_lbl
+        ));
+    }
+
+    fn copy_into_slot(
+        &mut self,
+        dest: &str,
+        src: &Expr,
+        asm: &mut String,
+    ) -> Result<(), CompileError> {
+        asm.push_str(&format!("    lea eax, {}\n", dest));
+        asm.push_str("    push eax\n");
+        self.addr_of_value(src, asm)?;
+        asm.push_str("    mov ebx, eax\n    pop eax\n");
+        let size = self.type_of(src)?.size_in_bytes(&self.analyzer.symbols.structs);
+        self.emit_copy_loop(asm, size);
+        Ok(())
+    }
+
+    fn generate_global_decl(&mut self, stmt: &Stmt) -> Result<String, CompileError> {
+        let (name, span) = match stmt {
+            Stmt::Let { name, span, .. } => (name.clone(), *span),
+            _ => unreachable!("global item is always a let"),
+        };
+        let g = self
+            .analyzer
+            .symbols
+            .lookup_global(&name)
+            .cloned()
+            .ok_or_else(|| {
+                CompileError::new("GEN_001", format!("unknown global '{}'", name), Some(span))
+            })?;
+        let mut out = String::new();
+        out.push_str(&format!("{}:\n", Self::global_label(&name)));
+        let mut cursor = 0u32;
+        self.emit_global_value(&g.ty, g.init.as_ref(), &mut cursor, &mut out)?;
+        Ok(out)
+    }
+
+    fn emit_global_value(
+        &mut self,
+        ty: &Type,
+        value: Option<&crate::sema::symbols::ConstValue>,
+        cursor: &mut u32,
+        out: &mut String,
+    ) -> Result<(), CompileError> {
+        use crate::sema::symbols::ConstValue;
+        let size = ty.size_in_bytes(&self.analyzer.symbols.structs);
+        let align = (size as u32).min(4);
+        let pad = (*cursor % align) as usize;
+        if pad != 0 {
+            out.push_str(&format!("    .space {}\n", align as usize - pad));
+            *cursor += (align as usize - pad) as u32;
+        }
+
+        match ty {
+            Type::Array(elem, len) => {
+                let values = match value {
+                    Some(ConstValue::Array(values)) => values,
+                    _ => {
+                        out.push_str(&format!("    .space {}\n", size));
+                        *cursor += size as u32;
+                        return Ok(());
+                    }
+                };
+                for i in 0..*len {
+                    self.emit_global_value(elem, values.get(i), cursor, out)?;
+                }
+            }
+            Type::Struct(name) => {
+                let def = self
+                    .analyzer
+                    .symbols
+                    .lookup_struct(name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        CompileError::new("SEM_001", format!("unknown struct '{}'", name), None)
+                    })?;
+                let fields = match value {
+                    Some(ConstValue::Struct(fields)) => fields.clone(),
+                    _ => Vec::new(),
+                };
+                for field in &def.fields {
+                    let field_value = fields
+                        .iter()
+                        .find(|(fname, _)| fname == &field.name)
+                        .map(|(_, v)| v);
+                    self.emit_global_value(&field.ty, field_value, cursor, out)?;
+                }
+            }
+            scalar => {
+                let width = scalar.size_in_bytes(&self.analyzer.symbols.structs);
+                match value {
+                    Some(ConstValue::Int(n)) => {
+                        if !crate::sema::types::int_fits(scalar, *n) {
+                            return Err(CompileError::new(
+                                "GEN_011",
+                                format!("value {} does not fit in {}", n, scalar.name()),
+                                None,
+                            ));
+                        }
+                        match width {
+                            1 => out.push_str(&format!("    .byte {}\n", n)),
+                            2 => out.push_str(&format!("    .word {}\n", n)),
+                            _ => out.push_str(&format!("    .long {}\n", n)),
+                        }
+                    }
+                    Some(ConstValue::Bool(b)) => {
+                        out.push_str(&format!("    .byte {}\n", if *b { 1 } else { 0 }))
+                    }
+                    Some(ConstValue::Str(s)) => {
+                        let id = self.add_string_literal(s);
+                        out.push_str(&format!("    .long .LC{}\n", id));
+                    }
+                    _ => out.push_str(&format!("    .space {}\n", width)),
+                }
+                *cursor += width as u32;
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_aggregate_assign(
+        &mut self,
+        target: &Expr,
+        value: &Expr,
+        asm: &mut String,
+    ) -> Result<(), CompileError> {
+        if let Expr::Ident(name, _) = target {
+            let dest = if let Some(sym) = self.lookup_var(name) {
+                Some(format!("[ebp + ({})]", sym.offset))
+            } else {
+                self.analyzer
+                    .symbols
+                    .lookup_global(name)
+                    .map(|g| format!("[{}]", Self::global_label(&g.name)))
+            };
+            if let Some(dest) = dest {
+                return self.copy_into_slot(&dest, value, asm);
+            }
+        }
+        self.generate_addr(target, asm)?;
+        asm.push_str("    push eax\n");
+        self.addr_of_value(value, asm)?;
+        asm.push_str("    mov ebx, eax\n    pop eax\n");
+        let size = self
+            .type_of(target)?
+            .size_in_bytes(&self.analyzer.symbols.structs);
+        self.emit_copy_loop(asm, size);
         Ok(())
     }
 
