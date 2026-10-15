@@ -16,6 +16,16 @@ pub enum ConstValue {
     Int(i64),
     Bool(bool),
     Str(String),
+    Array(Vec<ConstValue>),
+    Struct(Vec<(String, ConstValue)>),
+}
+
+#[derive(Debug, Clone)]
+pub struct GlobalSymbol {
+    pub name: String,
+    pub ty: Type,
+    pub is_mut: bool,
+    pub init: Option<ConstValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +68,7 @@ pub struct SymbolTable {
     functions: HashMap<String, FnSymbol>,
     fn_locals: HashMap<String, HashMap<String, Symbol>>,
     constants: HashMap<String, ConstSymbol>,
+    globals: HashMap<String, GlobalSymbol>,
     pub structs: StructTable,
 }
 
@@ -68,8 +79,21 @@ impl SymbolTable {
             functions: HashMap::new(),
             fn_locals: HashMap::new(),
             constants: HashMap::new(),
+            globals: HashMap::new(),
             structs: StructTable::new(),
         }
+    }
+
+    pub fn register_global(&mut self, global: GlobalSymbol) {
+        self.globals.insert(global.name.clone(), global);
+    }
+
+    pub fn lookup_global(&self, name: &str) -> Option<&GlobalSymbol> {
+        self.globals.get(name)
+    }
+
+    pub fn globals(&self) -> impl Iterator<Item = &GlobalSymbol> {
+        self.globals.values()
     }
 
     pub fn register_struct(&mut self, def: StructDef) {
