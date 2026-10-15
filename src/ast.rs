@@ -84,6 +84,9 @@ pub enum Expr {
     IntLit(i64, Span),
     StringLit(String, Span),
     BoolLit(bool, Span),
+    Null(Span),
+    Sizeof(Type, Span),
+    Cast(Box<Expr>, Type, Span),
     Ident(String, Span),
     Path(Vec<String>, Span),
     Field(Box<Expr>, String, Span),
@@ -115,6 +118,9 @@ impl Expr {
             Expr::IntLit(_, s) => *s,
             Expr::StringLit(_, s) => *s,
             Expr::BoolLit(_, s) => *s,
+            Expr::Null(s) => *s,
+            Expr::Sizeof(_, s) => *s,
+            Expr::Cast(_, _, s) => *s,
             Expr::Ident(_, s) => *s,
             Expr::Path(_, s) => *s,
             Expr::Field(_, _, s) => *s,
@@ -159,6 +165,12 @@ pub enum Stmt {
     While {
         cond: Expr,
         body: Vec<Stmt>,
+        span: Span,
+    },
+    Break {
+        span: Span,
+    },
+    Continue {
         span: Span,
     },
     For {
@@ -259,6 +271,7 @@ pub enum Item {
     Struct(StructDef),
     Import(Import),
     Const(Stmt),
+    Global(Stmt),
 }
 
 #[derive(Debug, Clone, PartialEq)]
